@@ -120,6 +120,10 @@ void StorageLayout::foreachField(
       if (!(callback(fieldIdx++, SparseTensorFieldKind::CrdMemRef, l, lt)))
         return;
     }
+    if (isEllpackLT(lt)) {
+      if (!(callback(fieldIdx++, SparseTensorFieldKind::MaxNnzMemRef, l, lt)))
+        return;
+    }
     if (!cooSegsRef.empty() && cooSegsRef.front().isSegmentStart(l)) {
       if (!cooSegsRef.front().isSoA) {
         // AoS COO, all singletons are fused into one memrefs. Skips the entire
@@ -147,39 +151,43 @@ void StorageLayout::foreachField(
 }
 
 void sparse_tensor::foreachFieldAndTypeInSparseTensor(
-    SparseTensorType stt,
-    llvm::function_ref<bool(Type, FieldIndex, SparseTensorFieldKind, Level,
-                            LevelType)>
-        callback) {
-  assert(stt.hasEncoding());
+  SparseTensorType stt,
+  llvm::function_ref<bool(Type, FieldIndex, SparseTensorFieldKind, Level,
+                          LevelType)>
+      callback) {
+assert(stt.hasEncoding());
 
-  SmallVector<int64_t> memrefShape =
-      getSparseFieldShape(stt.getEncoding(), stt.getDimShape());
+SmallVector<int64_t> memrefShape =
+    getSparseFieldShape(stt.getEncoding(), stt.getDimShape());
 
-  const Type specType = StorageSpecifierType::get(stt.getEncoding());
-  // memref<[batch] x ? x pos>  positions
-  const Type posMemType = MemRefType::get(memrefShape, stt.getPosType());
-  // memref<[batch] x ? x crd>  coordinates
-  const Type crdMemType = MemRefType::get(memrefShape, stt.getCrdType());
-  // memref<[batch] x ? x eltType> values
-  const Type valMemType = MemRefType::get(memrefShape, stt.getElementType());
+const Type specType = StorageSpecifierType::get(stt.getEncoding());
+// memref<[batch] x ? x pos>  positions
+const Type posMemType = MemRefType::get(memrefShape, stt.getPosType());
+// memref<[batch] x ? x crd>  coordinates
+const Type crdMemType = MemRefType::get(memrefShape, stt.getCrdType());
+// memref<[batch] x ? x eltType> values
+const Type valMemType = MemRefType::get(memrefShape, stt.getElementType());
+// memref<[batch] x ? x pos> max non-zeros per row (for ELLPACK)
+const Type maxNnzMemType = MemRefType::get(memrefShape, stt.getPosType());
 
-  StorageLayout(stt).foreachField([specType, posMemType, crdMemType, valMemType,
-                                   callback](FieldIndex fieldIdx,
-                                             SparseTensorFieldKind fieldKind,
-                                             Level lvl, LevelType lt) -> bool {
-    switch (fieldKind) {
-    case SparseTensorFieldKind::StorageSpec:
-      return callback(specType, fieldIdx, fieldKind, lvl, lt);
-    case SparseTensorFieldKind::PosMemRef:
-      return callback(posMemType, fieldIdx, fieldKind, lvl, lt);
-    case SparseTensorFieldKind::CrdMemRef:
-      return callback(crdMemType, fieldIdx, fieldKind, lvl, lt);
-    case SparseTensorFieldKind::ValMemRef:
-      return callback(valMemType, fieldIdx, fieldKind, lvl, lt);
-    };
-    llvm_unreachable("unrecognized field kind");
-  });
+StorageLayout(stt).foreachField([specType, posMemType, crdMemType, valMemType, maxNnzMemType,
+                                 callback](FieldIndex fieldIdx,
+                                           SparseTensorFieldKind fieldKind,
+                                           Level lvl, LevelType lt) -> bool {
+  switch (fieldKind) {
+  case SparseTensorFieldKind::StorageSpec:
+    return callback(specType, fieldIdx, fieldKind, lvl, lt);
+  case SparseTensorFieldKind::PosMemRef:
+    return callback(posMemType, fieldIdx, fieldKind, lvl, lt);
+  case SparseTensorFieldKind::CrdMemRef:
+    return callback(crdMemType, fieldIdx, fieldKind, lvl, lt);
+  case SparseTensorFieldKind::ValMemRef:
+    return callback(valMemType, fieldIdx, fieldKind, lvl, lt);
+  case SparseTensorFieldKind::MaxNnzMemRef:
+    return callback(maxNnzMemType, fieldIdx, fieldKind, lvl, lt);
+  };
+  llvm_unreachable("unrecognized field kind");
+});
 }
 
 unsigned StorageLayout::getNumFields() const {
@@ -1290,6 +1298,8 @@ static Type getFieldElemType(SparseTensorType stt, SparseTensorFieldKind kind) {
     return stt.getElementType();
   case SparseTensorFieldKind::StorageSpec:
     return nullptr;
+  case SparseTensorFieldKind::MaxNnzMemRef:
+    return stt.getPosType(); // Use position type for max non-zeros per row
   }
   llvm_unreachable("Unrecognizable FieldKind");
 }
