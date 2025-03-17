@@ -37,6 +37,9 @@ namespace sparse_tensor {
 ///        memref<[batch] x ? x crd>  coordinates ; coordinates for level l
 ///   ;  if singleton/2-out-of-4:
 ///        memref<[batch] x ? x crd>  coordinates ; coordinates for level l
+///   ;  if ELLPACK:
+///        memref<[batch] x ? x pos>  positions   ; positions for level l (max non-zeros per row)
+///        memref<[batch] x ? x crd>  coordinates ; coordinates for level l
 ///
 ///   memref<[batch] x ? x eltType> values        ; values
 ///
@@ -91,7 +94,8 @@ enum class SparseTensorFieldKind : uint32_t {
   StorageSpec = 0,
   PosMemRef = static_cast<uint32_t>(StorageSpecifierKind::PosMemSize),
   CrdMemRef = static_cast<uint32_t>(StorageSpecifierKind::CrdMemSize),
-  ValMemRef = static_cast<uint32_t>(StorageSpecifierKind::ValMemSize)
+  ValMemRef = static_cast<uint32_t>(StorageSpecifierKind::ValMemSize),
+  MaxNnzMemRef = static_cast<uint32_t>(StorageSpecifierKind::MaxNnzPerRow)
 };
 
 inline StorageSpecifierKind toSpecifierKind(SparseTensorFieldKind kind) {

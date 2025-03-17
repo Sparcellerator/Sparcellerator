@@ -237,6 +237,35 @@ public:
   }
 };
 
+class ELLPACKLevel : public SparseLevel</*hasPosBuf=*/true> {
+  public:
+    ELLPACKLevel(unsigned tid, Level lvl, LevelType lt, Value lvlSize,
+                 Value posBuffer, Value crdBuffer)
+        : SparseLevel(tid, lvl, lt, lvlSize, {posBuffer, crdBuffer}) {}
+  
+    ValuePair peekRangeAt(OpBuilder &b, Location l, ValueRange batchPrefix,
+                          ValueRange parentPos, Value inPadZone) const override {
+      assert(parentPos.size() == 1 &&
+             "ELLPACK level must be the first non-unique level.");
+      assert(!inPadZone && "Not implemented");
+      
+      Value p = parentPos.front();
+      
+      // For ELLPACK, we need to handle the fixed-width rows
+      // Load the max non-zeros per row from the position buffer
+      SmallVector<Value> memCrd(batchPrefix);
+      memCrd.push_back(C_IDX(0)); // The max non-zeros is stored at index 0
+      Value maxNnz = genIndexLoad(b, l, getPosBuf(), memCrd);
+      
+      // Calculate the start and end positions
+      Value startPos = MULI(p, maxNnz);
+      Value endPos = ADDI(startPos, maxNnz);
+      
+      return {startPos, endPos};
+    }
+  };
+  
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1574,6 +1603,8 @@ sparse_tensor::makeSparseTensorLevel(LevelType lt, Value sz, ValueRange b,
     return std::make_unique<SingletonLevel>(t, l, lt, sz, b[0]);
   case LevelFormat::NOutOfM:
     return std::make_unique<NOutOfMLevel>(t, l, lt, sz, b[0]);
+  case LevelFormat::ELLPACK:
+    return std::make_unique<ELLPACKLevel>(t, l, lt, sz, b[0], b[1]);
   case LevelFormat::Undef:
     llvm_unreachable("undefined level format");
   }

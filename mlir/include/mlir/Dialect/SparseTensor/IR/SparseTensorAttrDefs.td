@@ -572,6 +572,7 @@ def SparseTensorStorageSpecifierKindEnum
         I32EnumAttrCase<"ValMemSize", 3, "val_mem_sz">,
         I32EnumAttrCase<"DimOffset",  4, "dim_offset">,
         I32EnumAttrCase<"DimStride",  5, "dim_stride">,
+        I32EnumAttrCase<"MaxNnzPerRow", 6, "max_nnz_per_row">
       ]> {
   let genSpecializedAttr = 0;
   let cppNamespace = SparseTensor_Dialect.cppNamespace;

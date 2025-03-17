@@ -258,7 +258,8 @@ public:
     }
     case StorageSpecifierKind::CrdMemSize:
     case StorageSpecifierKind::PosMemSize:
-    case StorageSpecifierKind::ValMemSize: {
+    case StorageSpecifierKind::ValMemSize:
+    case StorageSpecifierKind::MaxNnzPerRow: {  // Added case for ELLPACK format
       auto enc = op.getSpecifier().getType().getEncoding();
       StorageLayout layout(enc);
       std::optional<unsigned> lvl;
@@ -272,7 +273,7 @@ public:
     }
     }
     llvm_unreachable("unrecognized specifer kind");
-  }
+  }  
 };
 
 struct StorageSpecifierSetOpConverter

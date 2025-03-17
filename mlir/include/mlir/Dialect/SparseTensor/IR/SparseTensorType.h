@@ -317,6 +317,7 @@ public:
   bool isUniqueLvl(Level l) const { return isUniqueLT(getLvlType(l)); }
   bool isWithPos(Level l) const { return isWithPosLT(getLvlType(l)); }
   bool isWithCrd(Level l) const { return isWithCrdLT(getLvlType(l)); }
+  bool isEllpackLvl(Level l) const { return isEllpackLT(getLvlType(l)); }
 
   /// Returns the coordinate-overhead bitwidth, defaulting to zero.
   unsigned getCrdWidth() const { return enc ? enc.getCrdWidth() : 0; }

@@ -89,6 +89,14 @@ public:
     return getMemRefField(SparseTensorFieldKind::PosMemRef, lvl);
   }
 
+  Value getCrdMemRef(Level lvl) const {
+    return getMemRefField(SparseTensorFieldKind::CrdMemRef, lvl);
+  }
+  
+  Value getMaxNnzMemRef(Level lvl) const {
+    return getMemRefField(SparseTensorFieldKind::MaxNnzMemRef, lvl);
+  }
+  
   Value getValMemRef() const {
     return getMemRefField(SparseTensorFieldKind::ValMemRef, std::nullopt);
   }
@@ -225,6 +233,31 @@ public:
 
   void setLvlSize(OpBuilder &builder, Location loc, Level lvl, Value v) {
     setSpecifierField(builder, loc, StorageSpecifierKind::LvlSize, lvl, v);
+  }
+
+  /// Sets the size of the memory buffer associated with the given storage
+  /// specifier kind and level.
+  void setMemSize(OpBuilder &builder, Location loc, StorageSpecifierKind kind,
+                 std::optional<Level> lvl, Value size) {
+    setSpecifierField(builder, loc, kind, lvl, size);
+  }
+  
+  Value getMaxNnzMemRef(Level lvl) const {
+    return getMemRefField(SparseTensorFieldKind::MaxNnzMemRef, lvl);
+  }
+  Value getMemSize(OpBuilder &builder, Location loc, StorageSpecifierKind kind, 
+      std::optional<Level> lvl = std::nullopt) const {
+      SparseTensorSpecifier md(getSpecifier());
+      return md.getSpecifierField(builder, loc, kind, lvl);
+  }
+
+  Value getMaxNnzMemSize(OpBuilder &builder, Location loc, Level lvl) const {
+    return getMemSize(builder, loc, StorageSpecifierKind::MaxNnzPerRow, lvl);
+  }
+
+  Value getCrdMemSizeUpdated(OpBuilder &builder, Location loc, Level lvl, Value newSize) const {
+    SparseTensorSpecifier md(getSpecifier());
+    return md.getSpecifierField(builder, loc, StorageSpecifierKind::CrdMemSize, lvl);
   }
 };
 

@@ -33,7 +33,7 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
   StringRef base;
   const auto loc = parser.getCurrentLocation();
   ERROR_IF(failed(parser.parseOptionalKeyword(&base)),
-           "expected valid level format (e.g. dense, compressed or singleton)")
+           "expected valid level format (e.g. dense, compressed, singleton, or ellpack)")
   uint64_t properties = 0;
   SmallVector<unsigned> structured;
 
@@ -73,6 +73,8 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
     properties |= static_cast<uint64_t>(LevelFormat::LooseCompressed);
   } else if (base == "singleton") {
     properties |= static_cast<uint64_t>(LevelFormat::Singleton);
+  } else if (base == "ellpack") {
+    properties |= static_cast<uint64_t>(LevelFormat::ELLPACK);
   } else {
     parser.emitError(loc, "unknown level format: ") << base;
     return failure();
@@ -82,6 +84,7 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
            "invalid level type: level format doesn't support the properties");
   return properties;
 }
+
 
 ParseResult LvlTypeParser::parseProperty(AsmParser &parser,
                                          uint64_t *properties) const {

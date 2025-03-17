@@ -159,6 +159,7 @@ enum class LevelFormat : uint64_t {
   Singleton = 0x00080000,
   LooseCompressed = 0x00100000,
   NOutOfM = 0x00200000,
+  ELLPACK = 0x00400000,  // New: ELLPACK format
 };
 
 constexpr bool encPowOfTwo(LevelFormat fmt) {
@@ -196,6 +197,8 @@ constexpr const char *toFormatString(LevelFormat lvlFmt) {
     return "loose_compressed";
   case LevelFormat::NOutOfM:
     return "structured";
+  case LevelFormat::ELLPACK:
+    return "ellpack";
   }
   return "";
 }
@@ -247,7 +250,7 @@ public:
                        LevelFormat::Batch, LevelFormat::NOutOfM>(fmt))
                ? (propertyBits == 0)
                : (isAnyOfFmt<LevelFormat::Compressed, LevelFormat::Singleton,
-                             LevelFormat::LooseCompressed>(fmt));
+                             LevelFormat::LooseCompressed, LevelFormat::ELLPACK>(fmt));
   }
 
   /// Convert a LevelFormat to its corresponding LevelType with the given
@@ -335,10 +338,10 @@ public:
 
   /// Check if the `LevelType` is considered to be sparse.
   constexpr bool hasSparseSemantic() const {
-    return isa<LevelFormat::Compressed, LevelFormat::Singleton,
-               LevelFormat::LooseCompressed, LevelFormat::NOutOfM>();
+    return isa<LevelFormat::Compressed, LevelFormat::Singleton, 
+               LevelFormat::LooseCompressed, LevelFormat::NOutOfM, LevelFormat::ELLPACK>();
   }
-
+  
   /// Check if the `LevelType` is considered to be dense-like.
   constexpr bool hasDenseSemantic() const {
     return isa<LevelFormat::Dense, LevelFormat::Batch>();
@@ -347,14 +350,33 @@ public:
   /// Check if the `LevelType` needs positions array.
   constexpr bool isWithPosLT() const {
     assert(!isa<LevelFormat::Undef>());
-    return isa<LevelFormat::Compressed, LevelFormat::LooseCompressed>();
+    return isa<LevelFormat::Compressed, LevelFormat::LooseCompressed, LevelFormat::ELLPACK>();
   }
-
+  
   /// Check if the `LevelType` needs coordinates array.
   constexpr bool isWithCrdLT() const {
     assert(!isa<LevelFormat::Undef>());
     // All sparse levels has coordinate array.
     return hasSparseSemantic();
+  }
+
+  /// Check if the `LevelType` is ordered.
+  constexpr bool isOrdered() const {
+    // ELLPACK has a defined order similar to Compressed
+    return isa<LevelFormat::Dense, LevelFormat::Compressed, LevelFormat::ELLPACK>();
+  }
+
+  /// Check if the `LevelType` is a singleton type.
+  constexpr bool isSingletonLT() const {
+    // ELLPACK is not a singleton type
+    return isa<LevelFormat::Singleton, LevelFormat::NOutOfM>();
+  }
+
+  /// Get number of arrays needed for this level type.
+  constexpr unsigned getNumArrays() const {
+    if (isa<LevelFormat::ELLPACK>())
+      return 3; // ELLPACK uses position, coordinate, and max per row arrays
+    return hasDenseSemantic() ? 0 : (isWithPosLT() ? 2 : 1);
   }
 
   constexpr unsigned getNumBuffer() const {
@@ -430,6 +452,7 @@ inline bool isUniqueLT(LevelType lt) {
 }
 inline bool isWithCrdLT(LevelType lt) { return lt.isWithCrdLT(); }
 inline bool isWithPosLT(LevelType lt) { return lt.isWithPosLT(); }
+inline bool isEllpackLT(LevelType lt) { return lt.isa<LevelFormat::ELLPACK>(); }
 inline bool isValidLT(LevelType lt) {
   return LevelType::isValidLvlBits(static_cast<uint64_t>(lt));
 }
