@@ -131,8 +131,7 @@ class GPU_SparseHandle<string typeStr, string description> :
 def GPU_SparseDnTensorHandle : GPU_SparseHandle<"SparseDnTensorHandleType", "dense tensor">;
 def GPU_SparseSpGEMMOpHandle : GPU_SparseHandle<"SparseSpGEMMOpHandleType", "SpGEMM operation">;
 def GPU_SparseSpMatHandle : GPU_SparseHandle<"SparseSpMatHandleType", "sparse matrix">;
-
-
+def GPU_ELLDescriptorHandle : GPU_SparseHandle<"ELLDescriptorHandleType", "ELL descriptor">;
 //===----------------------------------------------------------------------===//
 // GPU Interfaces.
 //===----------------------------------------------------------------------===//

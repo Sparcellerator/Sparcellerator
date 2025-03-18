@@ -2033,6 +2033,47 @@ def GPU_CreateDnTensorOp : GPU_Op<"create_dn_tensor", [GPU_AsyncOpInterface, Att
   }];
 }
 
+
+def GPU_SpMVELLOp : GPU_Op<"spmv_ell", []> {
+  let summary = "Perform sparse matrix-vector multiplication for ELLPACK format";
+  let description = [{
+    Performs Y = A * X where A is an ELLPACK format sparse matrix and X, Y are dense vectors.
+    Specialized version for ELLPACK format.
+  }];
+  
+  let arguments = (ins
+    GPU_AsyncToken:$token,
+    GPU_SparseSpMatHandle:$spMatrix,
+    GPU_ELLDescriptorHandle:$ellDescriptor,
+    GPU_SparseDnTensorHandle:$denseVectorX,
+    GPU_SparseDnTensorHandle:$denseVectorY,
+    TypeAttr:$computeType,
+    Arg<AnyMemRef, "Buffer for the operation", [MemRead, MemWrite]>:$buffer,
+    Arg<AnyMemRef, "ELLPACK-specific buffer", [MemRead, MemWrite]>:$ellBuffer
+  );
+  
+  let results = (outs
+    GPU_AsyncToken:$async_token
+  );
+}
+
+
+def GPU_DestroyELLDescriptorOp : GPU_Op<"destroy_ell_descriptor", []> {
+  let summary = "Destroy an ELLPACK descriptor";
+  let description = [{
+    Destroys an ELLPACK descriptor and frees associated resources.
+  }];
+  
+  let arguments = (ins
+    GPU_AsyncToken:$token,
+    GPU_ELLDescriptorHandle:$ellDescriptor
+  );
+  
+  let results = (outs
+    GPU_AsyncToken:$async_token
+  );
+}
+
 def GPU_DestroyDnTensorOp : GPU_Op<"destroy_dn_tensor", [GPU_AsyncOpInterface]> {
   let summary = "Destroy dense tensor operation";
   let description = [{
@@ -2370,6 +2411,26 @@ def GPU_TransposeModeAttr : EnumAttr<GPU_Dialect, GPU_TransposeMode,
   let defaultValue = "TransposeMode::NON_TRANSPOSE";
 }
 
+def GPU_CreateELLDescriptorOp : GPU_Op<"create_ell_descriptor", []> {
+  let summary = "Create an ELLPACK descriptor";
+  let description = [{
+    Creates a descriptor for an ELLPACK format sparse matrix.
+    Required for cuSPARSE ELLPACK format operations.
+  }];
+  
+  let arguments = (ins
+    GPU_AsyncToken:$token,
+    Index:$maxNnzPerRow,
+    Index:$numRows
+  );
+  
+  let results = (outs
+    GPU_ELLDescriptorHandle:$result,
+    GPU_AsyncToken:$async_token
+  );
+}
+
+
 def GPU_SpMVBufferSizeOp : GPU_Op<"spmv_buffer_size", [GPU_AsyncOpInterface]> {
   let summary = "Precompute buffersize for SpMV operation";
   let description = [{
@@ -2576,6 +2637,100 @@ def GPU_SpMMOp : GPU_Op<"spmm", [GPU_AsyncOpInterface, AttrSizedOperandSegments]
     $spmatA (`{` $modeA^ `}`)? `,` $dnmatB (`{` $modeB^ `}`)? `,` $dnmatC `,` $buffers attr-dict `:` type($buffers) `into` $computeType
   }];
 }
+
+def GPU_SpMMELLOp : GPU_Op<"spmm_ell", [GPU_AsyncOpInterface]> {
+  let summary = "Perform sparse matrix-matrix multiplication for ELLPACK format";
+  let description = [{
+    The `gpu.spmm_ell` operation performs matrix-matrix multiplication where the first 
+    matrix is in ELLPACK sparse format and the second and result matrices are dense.
+    
+    This operation is specialized for the ELLPACK sparse matrix format which stores 
+    a fixed number of non-zeros per row, making it particularly efficient for GPU execution 
+    when the number of non-zeros per row is relatively uniform.
+
+    If the `async` keyword is present, the op is executed asynchronously (i.e.
+    it does not block until the execution has finished on the device). In
+    that case, it returns a !gpu.async.token.
+
+    Example:
+
+    ```
+    %token = gpu.spmm_ell async [%dep] %spmat, %ellDesc, %dnmatB, %dnmatC, 
+                               %computeType, %buffer, %ellBuffer
+    ```
+  }];
+  
+  let arguments = (ins
+    Variadic<GPU_AsyncToken>:$asyncDependencies,
+    GPU_SparseSpMatHandle:$spMatrix,
+    GPU_ELLDescriptorHandle:$ellDescriptor,
+    GPU_SparseDnTensorHandle:$denseMatrixB,
+    GPU_SparseDnTensorHandle:$denseMatrixC,
+    TypeAttr:$computeType,
+    AnyMemRef:$buffer,
+    AnyMemRef:$ellBuffer
+  );
+  
+  let results = (outs
+    Optional<GPU_AsyncToken>:$asyncToken
+  );
+  
+  let assemblyFormat = [{
+    custom<AsyncDependencies>(type($asyncToken), $asyncDependencies)
+    $spMatrix `,` $ellDescriptor `,` $denseMatrixB `,` $denseMatrixC `,` 
+    $computeType `,` $buffer `,` $ellBuffer attr-dict `:` 
+    type($spMatrix) `,` type($ellDescriptor) `,` type($denseMatrixB) `,` 
+    type($denseMatrixC) `,` type($buffer) `,` type($ellBuffer)
+  }];
+}
+
+def GPU_SDDMMELLOp : GPU_Op<"sddmm_ell", [GPU_AsyncOpInterface]> {
+  let summary = "Perform SDDMM with ELLPACK format sparse matrix";
+  let description = [{
+    The `gpu.sddmm_ell` operation performs sampled dense-dense matrix multiplication 
+    where the result is stored in an ELLPACK format sparse matrix.
+    
+    SDDMM performs the operation: C = (A * B) .* C_mask
+    where A and B are dense matrices, C is a sparse matrix in ELLPACK format,
+    and C_mask represents the sparsity pattern of C. The operation only computes
+    elements at positions where C has non-zero entries.
+
+    If the `async` keyword is present, the op is executed asynchronously (i.e.
+    it does not block until the execution has finished on the device). In
+    that case, it returns a !gpu.async.token.
+
+    Example:
+
+    ```
+    %token = gpu.sddmm_ell async [%dep] %dnmatA, %dnmatB, %spmatC, 
+                                %ellDesc, %computeType, %buffer, %ellBuffer
+    ```
+  }];
+  
+  let arguments = (ins
+    Variadic<GPU_AsyncToken>:$asyncDependencies,
+    GPU_SparseDnTensorHandle:$denseMatrixA,
+    GPU_SparseDnTensorHandle:$denseMatrixB,
+    GPU_SparseSpMatHandle:$spMatrix,
+    GPU_ELLDescriptorHandle:$ellDescriptor,
+    TypeAttr:$computeType,
+    AnyMemRef:$buffer,
+    AnyMemRef:$ellBuffer
+  );
+  
+  let results = (outs
+    Optional<GPU_AsyncToken>:$asyncToken
+  );
+  
+  let assemblyFormat = [{
+    custom<AsyncDependencies>(type($asyncToken), $asyncDependencies)
+    $denseMatrixA `,` $denseMatrixB `,` $spMatrix `,` $ellDescriptor `,`
+    $computeType `,` $buffer `,` $ellBuffer attr-dict `:` 
+    type($denseMatrixA) `,` type($denseMatrixB) `,` type($spMatrix) `,`
+    type($ellDescriptor) `,` type($buffer) `,` type($ellBuffer)
+  }];
+}
+
 
 def GPU_SDDMMBufferSizeOp : GPU_Op<"sddmm_buffer_size", [GPU_AsyncOpInterface]> {
   let summary = "Precompute buffersize for SDDMM operation";

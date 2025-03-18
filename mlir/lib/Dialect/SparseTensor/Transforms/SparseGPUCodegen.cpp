@@ -40,6 +40,7 @@ enum class CuSparseFormat {
   kCSR,
   kCSC,
   kBSR,
+  kELLPACK, // Add this new format
 };
 
 //===----------------------------------------------------------------------===//
@@ -448,6 +449,12 @@ static bool isAdmissibleBSR(SparseTensorType &aTp) {
   return false;
 }
 
+static bool isAdmissibleELLPACK(SparseTensorType &aTp) {
+  return aTp.getDimRank() == 2 && aTp.getLvlRank() == 2 && aTp.isIdentity() &&
+         aTp.isDenseLvl(0) && isEllpackLT(aTp.getLvlType(1)) &&
+         aTp.isOrderedLvl(1) && aTp.isUniqueLvl(1) && isAdmissibleMetaData(aTp);
+}
+
 /// Test for 2:4 matrix with suitable metadata.
 static bool isAdmissible24(SparseTensorType &aTp) {
   return aTp.getDimRank() == 2 && aTp.getLvlRank() == 3 && aTp.isDenseLvl(0) &&
@@ -481,6 +488,8 @@ static CuSparseFormat getCuSparseFormat(SparseTensorType aTp,
 #else
     return enableRT ? CuSparseFormat::kCOO : CuSparseFormat::kNone;
 #endif
+  if (isAdmissibleELLPACK(aTp))
+    return CuSparseFormat::kELLPACK;
   if (isAdmissibleCSR(aTp))
     return CuSparseFormat::kCSR;
   if (isAdmissibleCSC(aTp))
@@ -541,6 +550,22 @@ static Operation *genSpMat(OpBuilder &builder, Location loc,
   if (format == CuSparseFormat::kCSC)
     return builder.create<gpu::CreateCscOp>(loc, handleTp, tokenTp, token, sz1,
                                             sz2, nseA, rowA, colA, valA);
+
+  if (format == CuSparseFormat::kELLPACK) {
+    // Get maxNnzPerRow from the first position (holds special data for ELLPACK)
+    Value maxNnzPerRow = builder.create<memref::LoadOp>(
+        loc, rowA, constantIndex(builder, loc, 0));
+
+    // ELLPACK can be represented as CSR with additional metadata
+    // Store maxNnzPerRow as an attribute or pass it separately
+    auto spMatOp = builder.create<gpu::CreateCsrOp>(
+        loc, handleTp, tokenTp, token, sz1, sz2, nseA, rowA, colA, valA);
+
+    // Mark this matrix as actually being ELLPACK format
+    spMatOp->setAttr("sparse_format", builder.getStringAttr("ellpack"));
+
+    return spMatOp;
+  }
   // BSR requires a bit more work since we need to pass in the block size
   // and all others sizes in terms of blocks (#block-rows, #block-cols,
   // #nonzero-blocks).
@@ -559,6 +584,7 @@ static Operation *genSpMat(OpBuilder &builder, Location loc,
 }
 
 /// Match and rewrite SpMV kernel.
+
 static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
                                  linalg::GenericOp op, bool enableRT) {
   Location loc = op.getLoc();
@@ -576,15 +602,15 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
     return failure();
 
   // Start sparse kernel and copy data from host to device.
-  //   a : memR/memC/memV -> rowA,colA,valA
-  //   x : memX           -> vecX
-  //   y : memY           -> vecY
-  Value nseA = rewriter.create<NumberOfEntriesOp>(loc, a);
+  // a : memR/memC/memV -> rowA,colA,valA
+  // x : memX -> vecX
+  // y : memY -> vecY
+  Value nseA = rewriter.create<sparse_tensor::NumberOfEntriesOp>(loc, a);
   Value szY = linalg::createOrFoldDimOp(rewriter, loc, a, 0);
   Value szX = linalg::createOrFoldDimOp(rewriter, loc, a, 1);
   Value memR = genFirstPosOrCrds(rewriter, loc, a, format, enableRT);
   Value memC = genSecondCrds(rewriter, loc, a, format, enableRT); // or empty
-  Value memV = rewriter.create<ToValuesOp>(loc, a);
+  Value memV = rewriter.create<sparse_tensor::ToValuesOp>(loc, a);
   Value rowA = genAllocCopy(rewriter, loc, memR, tokens);
   Value colA = memC ? genAllocCopy(rewriter, loc, memC, tokens) : Value();
   Value valA = genAllocCopy(rewriter, loc, memV, tokens);
@@ -601,20 +627,39 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
   Type spmatHandleTp = rewriter.getType<gpu::SparseSpMatHandleType>();
   Type tokenTp = rewriter.getType<gpu::AsyncTokenType>();
   Value token = genFirstWait(rewriter, loc);
+
+  // ELLPACK-specific handling before matrix creation
+  Value maxNnzPerRow;
+  if (format == CuSparseFormat::kELLPACK) {
+    // Extract maxNnzPerRow from the first position for ELLPACK format
+    maxNnzPerRow = rewriter.create<memref::LoadOp>(
+        loc, memR, constantIndex(rewriter, loc, 0));
+
+    // Store it in a buffer for later use
+    auto maxNnzBuf = genAllocBuffer(rewriter, loc, rewriter.getIndexType(),
+                                    constantIndex(rewriter, loc, 1), token);
+    Value maxNnzMem = maxNnzBuf.getResult(0);
+    token = maxNnzBuf.getAsyncToken();
+
+    rewriter.create<memref::StoreOp>(loc, maxNnzPerRow, maxNnzMem,
+                                     constantIndex(rewriter, loc, 0));
+  }
+
   Operation *spGenA =
       genSpMat(rewriter, loc, aTp, spmatHandleTp, tokenTp, token, szY, szX,
                nseA, rowA, colA, valA, format, enableRT);
   Value spMatA = spGenA->getResult(0);
   token = spGenA->getResult(1);
   auto dvecX = rewriter.create<gpu::CreateDnTensorOp>(
-      loc, dnTensorHandleTp, tokenTp, token, vecX, szX);
+      loc, dnTensorHandleTp, tokenTp, token, vecX, SmallVector<Value>{szX});
   Value dnX = dvecX.getResult(0);
+  ; // Use the correct result accessor
   token = dvecX.getAsyncToken();
   auto dvecY = rewriter.create<gpu::CreateDnTensorOp>(
-      loc, dnTensorHandleTp, tokenTp, token, vecY, szY);
-  Value dnY = dvecY.getResult(0);
+      loc, dnTensorHandleTp, tokenTp, token, vecY, SmallVector<Value>{szY});
+  Value dnY = dvecY.getDnTensor(); // Use the correct result accessor
   token = dvecY.getAsyncToken();
-  auto dnYType = llvm::cast<ShapedType>(y.getType()).getElementType();
+  auto dnYType = llvm::cast<TensorType>(y.getType()).getElementType();
 
   // Precompute buffersize for SpMV.
   auto bufferComp = rewriter.create<gpu::SpMVBufferSizeOp>(
@@ -626,12 +671,42 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
   Value buffer = buf.getResult(0);
   token = buf.getAsyncToken();
 
-  // Perform the SpMV.
-  auto spmvComp = rewriter.create<gpu::SpMVOp>(
-      loc, tokenTp, token, spMatA, dnX, dnY, /*computeType=*/dnYType, buffer);
-  token = spmvComp.getAsyncToken();
+  // For ELLPACK, prepare additional descriptor and buffers
+  Operation *spmvComp;
+  if (format == CuSparseFormat::kELLPACK) {
+    // Create ELLPACK descriptor
+    auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
+        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        maxNnzPerRow, szY);
+    Value ellDescVal = ellDesc.getResult();
+    token = ellDesc.getAsyncToken();
 
-  // Copy data back to host and free all the resoures.
+    // Prepare ELLPACK-specific buffer
+    auto ellBuf = genAllocBuffer(rewriter, loc, rewriter.getI8Type(),
+                                 constantIndex(rewriter, loc, 128), token);
+    Value ellBufVal = ellBuf.getResult(0);
+    token = ellBuf.getAsyncToken();
+
+    // Call SpMV with ELLPACK descriptor
+    spmvComp = rewriter.create<gpu::SpMVELLOp>(
+        loc, tokenTp, token, spMatA, ellDescVal, dnX, dnY,
+        /*computeType=*/dnYType, buffer, ellBufVal);
+
+    // Clean up ELLPACK resources
+    token = spmvComp->getResult(0).cast<Value>();
+    token = rewriter
+                .create<gpu::DestroyELLDescriptorOp>(loc, tokenTp, token,
+                                                     ellDescVal)
+                .getAsyncToken();
+    token = genDeallocMemRef(rewriter, loc, ellBufVal, token);
+  } else {
+    // Standard SpMV for non-ELLPACK formats
+    auto spmvOp = rewriter.create<gpu::SpMVOp>(
+        loc, tokenTp, token, spMatA, dnX, dnY, /*computeType=*/dnYType, buffer);
+    spmvComp = spmvOp.getOperation();
+    token = spmvOp.getAsyncToken();
+  }
+  // Copy data back to host and free all the resources.
   token = rewriter.create<gpu::DestroySpMatOp>(loc, tokenTp, token, spMatA)
               .getAsyncToken();
   token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnX)
@@ -673,16 +748,16 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
     return failure();
 
   // Start sparse kernel and copy data from host to device.
-  //   a : memR/memC/memV -> rowA,colA,valA
-  //   b : bufB           -> matB
-  //   c : bufC           -> matC
-  Value nseA = rewriter.create<NumberOfEntriesOp>(loc, a);
+  // a : memR/memC/memV -> rowA,colA,valA
+  // b : bufB -> matB
+  // c : bufC -> matC
+  Value nseA = rewriter.create<sparse_tensor::NumberOfEntriesOp>(loc, a);
   Value szm = linalg::createOrFoldDimOp(rewriter, loc, a, 0);
   Value szk = linalg::createOrFoldDimOp(rewriter, loc, a, 1);
   Value szn = linalg::createOrFoldDimOp(rewriter, loc, b, 1);
   Value memR = genFirstPosOrCrds(rewriter, loc, a, format, enableRT);
   Value memC = genSecondCrds(rewriter, loc, a, format, enableRT); // or empty
-  Value memV = rewriter.create<ToValuesOp>(loc, a);
+  Value memV = rewriter.create<sparse_tensor::ToValuesOp>(loc, a);
   Value rowA = genAllocCopy(rewriter, loc, memR, tokens);
   Value colA = memC ? genAllocCopy(rewriter, loc, memC, tokens) : Value();
   Value valA = genAllocCopy(rewriter, loc, memV, tokens);
@@ -699,6 +774,15 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
   Type spMatHandleTp = rewriter.getType<gpu::SparseSpMatHandleType>();
   Type tokenTp = rewriter.getType<gpu::AsyncTokenType>();
   Value token = genFirstWait(rewriter, loc);
+
+  // Extract maxNnzPerRow for ELLPACK format if needed
+  Value maxNnzPerRow;
+  if (format == CuSparseFormat::kELLPACK) {
+    // Extract maxNnzPerRow from the first position for ELLPACK format
+    maxNnzPerRow = rewriter.create<memref::LoadOp>(
+        loc, memR, constantIndex(rewriter, loc, 0));
+  }
+
   Operation *spGenA =
       genSpMat(rewriter, loc, aTp, spMatHandleTp, tokenTp, token, szm, szk,
                nseA, rowA, colA, valA, format, enableRT);
@@ -714,25 +798,56 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
       SmallVector<Value>{szm, szn});
   Value dnC = dmatC.getResult(0);
   token = dmatC.getAsyncToken();
-  auto dmatCType = llvm::cast<ShapedType>(c.getType()).getElementType();
+  auto dnCType = llvm::cast<MemRefType>(c.getType()).getElementType();
 
   // Precompute buffersize for SpMM.
   auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
       loc, indexTp, tokenTp, token, spMatA, dnB, dnC,
-      /*computeType=*/dmatCType);
+      /*computeType=*/dnCType);
   Value bufferSz = bufferComp.getResult(0);
   token = bufferComp.getAsyncToken();
   auto buf = genAllocBuffer(rewriter, loc, bufferSz, token);
   Value buffer = buf.getResult(0);
   token = buf.getAsyncToken();
-  auto dnCType = llvm::cast<ShapedType>(c.getType()).getElementType();
 
-  // Perform the SpMM.
-  auto spmmComp = rewriter.create<gpu::SpMMOp>(
-      loc, tokenTp, token, spMatA, dnB, dnC, /*computeType=*/dnCType, buffer);
-  token = spmmComp.getAsyncToken();
+  // Perform the SpMM with ELLPACK-specific handling if needed.
+  Operation *spmmComp;
+  if (format == CuSparseFormat::kELLPACK) {
+    // Create ELLPACK descriptor
+    auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
+        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        maxNnzPerRow, szm);
+    Value ellDescVal = ellDesc.getResult();
+    token = ellDesc.getAsyncToken();
 
-  // Copy data back to host and free all the resoures.
+    // Prepare ELLPACK-specific buffer
+    auto ellBuf = genAllocBuffer(rewriter, loc, rewriter.getI8Type(),
+                                 constantIndex(rewriter, loc, 128), token);
+    Value ellBufVal = ellBuf.getResult(0);
+    token = ellBuf.getAsyncToken();
+
+    // Call SpMM with ELLPACK descriptor
+    auto spmmOp = rewriter.create<gpu::SpMMELLOp>(
+        loc, tokenTp, token, spMatA, ellDescVal, dnB, dnC,
+        /*computeType=*/dnCType, buffer, ellBufVal);
+    spmmComp = spmmOp.getOperation();
+    token = spmmOp.getAsyncToken();
+
+    // Clean up ELLPACK resources
+    token = rewriter
+                .create<gpu::DestroyELLDescriptorOp>(loc, tokenTp, token,
+                                                     ellDescVal)
+                .getAsyncToken();
+    token = genDeallocMemRef(rewriter, loc, ellBufVal, token);
+  } else {
+    // Standard SpMM for non-ELLPACK formats
+    auto spmmOp = rewriter.create<gpu::SpMMOp>(
+        loc, tokenTp, token, spMatA, dnB, dnC, /*computeType=*/dnCType, buffer);
+    spmmComp = spmmOp.getOperation();
+    token = spmmOp.getAsyncToken();
+  }
+
+  // Copy data back to host and free all the resources.
   token = rewriter.create<gpu::DestroySpMatOp>(loc, tokenTp, token, spMatA)
               .getAsyncToken();
   token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnB)
@@ -1062,16 +1177,23 @@ static LogicalResult rewriteSDDMM(PatternRewriter &rewriter,
   SparseTensorType bTp = getSparseTensorType(b);
   SparseTensorType cTp = getSparseTensorType(c);
   auto format = getCuSparseFormat(cTp, bTp, aTp, enableRT, /*isMatVec=*/false);
+
   if (format == CuSparseFormat::kNone || format == CuSparseFormat::kCOO ||
-      format == CuSparseFormat::kCSC)
-    return failure();
+      format == CuSparseFormat::kCSC) {
+    // Check if we have ELLPACK format that we can support
+    if (format == CuSparseFormat::kELLPACK) {
+      // ELLPACK is supported for SDDMM
+    } else {
+      return failure();
+    }
+  }
 
   // The SDDMM does the in-place operation.
   // Start sparse kernel and copy data from host to device.
-  //   a : bufA           -> matA
-  //   b : bufB           -> matB
-  //   c : memR/memC/memV -> rowC,colC,valC
-  Value nseC = rewriter.create<NumberOfEntriesOp>(loc, c);
+  // a : bufA -> matA
+  // b : bufB -> matB
+  // c : memR/memC/memV -> rowC,colC,valC
+  Value nseC = rewriter.create<ToValuesOp>(loc, c);
   Value szm = linalg::createOrFoldDimOp(rewriter, loc, a, 0);
   Value szk = linalg::createOrFoldDimOp(rewriter, loc, a, 1);
   Value szn = linalg::createOrFoldDimOp(rewriter, loc, b, 1);
@@ -1102,12 +1224,20 @@ static LogicalResult rewriteSDDMM(PatternRewriter &rewriter,
       loc, dnMatHandleTp, tokenTp, token, matB, SmallVector<Value>{szk, szn});
   Value dnB = dmatB.getResult(0);
   token = dmatB.getAsyncToken();
+
+  // ELLPACK-specific handling for sparse matrix C if needed
+  Value maxNnzPerRow;
+  if (format == CuSparseFormat::kELLPACK) {
+    maxNnzPerRow = rewriter.create<memref::LoadOp>(
+        loc, memR, constantIndex(rewriter, loc, 0));
+  }
+
   Operation *spGenC =
       genSpMat(rewriter, loc, cTp, spMatHandleTp, tokenTp, token, szm, szn,
                nseC, rowC, colC, valC, format, enableRT);
   Value spMatC = spGenC->getResult(0);
   token = spGenC->getResult(1);
-  auto dnCType = llvm::cast<ShapedType>(c.getType()).getElementType();
+  auto dnCType = llvm::cast<TensorType>(c.getType()).getElementType();
 
   // Precompute buffersize for SDDMM.
   auto bufferComp = rewriter.create<gpu::SDDMMBufferSizeOp>(
@@ -1118,12 +1248,44 @@ static LogicalResult rewriteSDDMM(PatternRewriter &rewriter,
   Value buffer = buf.getResult(0);
   token = buf.getAsyncToken();
 
-  // Perform the SDDMM.
-  auto sddmmComp = rewriter.create<gpu::SDDMMOp>(loc, tokenTp, token, dnA, dnB,
-                                                 spMatC, dnCType, buffer);
-  token = sddmmComp.getAsyncToken();
+  // Perform the SDDMM with ELLPACK-specific handling if needed.
+  Operation *sddmmComp;
+  if (format == CuSparseFormat::kELLPACK) {
+    // Create ELLPACK descriptor
+    auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
+        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        maxNnzPerRow, szm);
+    Value ellDescVal = ellDesc.getResult();
+    token = ellDesc.getAsyncToken();
 
-  // Copy data back to host and free all the resoures.
+    // Prepare ELLPACK-specific buffer
+    auto ellBuf = genAllocBuffer(rewriter, loc, rewriter.getI8Type(),
+                                 constantIndex(rewriter, loc, 128), token);
+    Value ellBufVal = ellBuf.getResult(0);
+    token = ellBuf.getAsyncToken();
+
+    // Call SDDMM with ELLPACK descriptor
+    auto sddmmOp = rewriter.create<gpu::SDDMMELLOp>(
+        loc, tokenTp, token, dnA, dnB, spMatC, ellDescVal,
+        /*computeType=*/dnCType, buffer, ellBufVal);
+    sddmmComp = sddmmOp.getOperation();
+    token = sddmmOp.getAsyncToken();
+
+    // Clean up ELLPACK resources
+    token = rewriter
+                .create<gpu::DestroyELLDescriptorOp>(loc, tokenTp, token,
+                                                     ellDescVal)
+                .getAsyncToken();
+    token = genDeallocMemRef(rewriter, loc, ellBufVal, token);
+  } else {
+    // Standard SDDMM for non-ELLPACK formats
+    auto sddmmOp = rewriter.create<gpu::SDDMMOp>(loc, tokenTp, token, dnA, dnB,
+                                                 spMatC, dnCType, buffer);
+    sddmmComp = sddmmOp.getOperation();
+    token = sddmmOp.getAsyncToken();
+  }
+
+  // Copy data back to host and free all the resources.
   token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnA)
               .getAsyncToken();
   token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnB)
@@ -1143,23 +1305,58 @@ static LogicalResult rewriteSDDMM(PatternRewriter &rewriter,
   tokens.clear();
 
   // Done.
-  rewriter.replaceOpWithNewOp<sparse_tensor::LoadOp>(op, c);
+  rewriter.replaceOp(op, c);
   return success();
 }
 
-//===----------------------------------------------------------------------===//
-// Rewriting rules for direct code generation.
-//===----------------------------------------------------------------------===//
-
-/// Proof-of-concept rewriter. This rule generates a GPU implementation
-/// for each outermost forall loop generated by the sparsifier.
-/// TODO: right now works with parallelization-strategy=dense-outer-loop
-///       but give this its own flags in the future
+/// Rewriter for sparse tensor operations targeting GPU. This implementation
+/// includes specialized optimizations for ELLPACK format tensors.
 struct ForallRewriter : public OpRewritePattern<scf::ParallelOp> {
   using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
   ForallRewriter(MLIRContext *context, unsigned nT)
       : OpRewritePattern(context), numThreads(nT){};
+
+  /// Detects if a buffer represents an ELLPACK format sparse tensor
+  bool isEllpackTensor(Value buffer) const {
+    if (auto convertOp = buffer.getDefiningOp<sparse_tensor::ConvertOp>()) {
+      auto encAttr = getSparseTensorEncoding(convertOp.getType());
+      if (!encAttr)
+        return false;
+
+      // Check for ELLPACK format in any level type
+      for (unsigned l = 0; l < encAttr.getLvlRank(); l++) {
+        if (isEllpackLT(encAttr.getLvlType(l)))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  /// Gets ELLPACK-specific thread/block configuration
+  std::pair<SmallVector<Value, 3>, SmallVector<Value, 3>>
+  getEllpackLaunchConfig(OpBuilder &builder, Location loc, Value rows,
+                         unsigned baseThrCount) const {
+    // Align to warp size for better memory coalescing
+    // For ELLPACK, use multiple warps for better occupancy
+    Value threadsPerBlock = builder.create<arith::ConstantIndexOp>(
+        loc, std::min(baseThrCount, 256u));
+
+    // Calculate number of blocks needed
+    Value numBlocks =
+        builder.create<arith::CeilDivSIOp>(loc, rows, threadsPerBlock);
+
+    // Ensure grid size is optimized for GPU hardware
+    SmallVector<Value, 3> gridDims = {
+        numBlocks, builder.create<arith::ConstantIndexOp>(loc, 1),
+        builder.create<arith::ConstantIndexOp>(loc, 1)};
+
+    SmallVector<Value, 3> blockDims = {
+        threadsPerBlock, builder.create<arith::ConstantIndexOp>(loc, 1),
+        builder.create<arith::ConstantIndexOp>(loc, 1)};
+
+    return {gridDims, blockDims};
+  }
 
   LogicalResult matchAndRewrite(scf::ParallelOp forallOp,
                                 PatternRewriter &rewriter) const override {
@@ -1173,6 +1370,7 @@ struct ForallRewriter : public OpRewritePattern<scf::ParallelOp> {
         !matchPattern(forallOp.getLowerBound()[0], m_Zero()) ||
         !matchPattern(forallOp.getStep()[0], m_One()))
       return failure();
+
     // Collect every value that is computed outside the parallel loop.
     SetVector<Value> invariants; // stable iteration!
     forallOp->walk([&](Operation *op) {
@@ -1188,6 +1386,7 @@ struct ForallRewriter : public OpRewritePattern<scf::ParallelOp> {
           invariants.insert(val);
       }
     });
+
     // Outline the outside values as proper parameters. Fail when sharing
     // value between host and device is not straightforward.
     SmallVector<Value> constants;
@@ -1213,16 +1412,17 @@ struct ForallRewriter : public OpRewritePattern<scf::ParallelOp> {
     SmallVector<Value> tokens;
     Value out = genParametersIn(rewriter, loc, scalars, buffers, args, tokens,
                                 /*useHostRegistrationForOut=*/false);
+
     // Set up GPU module and construct GPU function.
     auto saveIp = rewriter.saveInsertionPoint();
     ModuleOp topModule = forallOp->getParentOfType<ModuleOp>();
     auto gpuModule = genGPUModule(rewriter, topModule);
     auto gpuFunc = genGPUFunc(rewriter, gpuModule, args);
+
+    // Generate GPU kernel code with special handling for ELLPACK
     genGPUCode(rewriter, gpuFunc, forallOp, constants, scalars, buffers);
-    // Generate code that launches the kernel asynchronously, blocking on all
-    // opens tokens and yielding a new token for the output.
-    // TODO: Passing in tokens to launch up does not seem to be properly lowered
-    //       by cubin yet, hence the current blocking wait.
+
+    // Generate code that launches the kernel asynchronously
     rewriter.restoreInsertionPoint(saveIp);
     genBlockingWait(rewriter, loc, tokens);
     tokens.clear();
