@@ -151,43 +151,43 @@ void StorageLayout::foreachField(
 }
 
 void sparse_tensor::foreachFieldAndTypeInSparseTensor(
-  SparseTensorType stt,
-  llvm::function_ref<bool(Type, FieldIndex, SparseTensorFieldKind, Level,
-                          LevelType)>
-      callback) {
-assert(stt.hasEncoding());
+    SparseTensorType stt,
+    llvm::function_ref<bool(Type, FieldIndex, SparseTensorFieldKind, Level,
+                            LevelType)>
+        callback) {
+  assert(stt.hasEncoding());
 
-SmallVector<int64_t> memrefShape =
-    getSparseFieldShape(stt.getEncoding(), stt.getDimShape());
+  SmallVector<int64_t> memrefShape =
+      getSparseFieldShape(stt.getEncoding(), stt.getDimShape());
 
-const Type specType = StorageSpecifierType::get(stt.getEncoding());
-// memref<[batch] x ? x pos>  positions
-const Type posMemType = MemRefType::get(memrefShape, stt.getPosType());
-// memref<[batch] x ? x crd>  coordinates
-const Type crdMemType = MemRefType::get(memrefShape, stt.getCrdType());
-// memref<[batch] x ? x eltType> values
-const Type valMemType = MemRefType::get(memrefShape, stt.getElementType());
-// memref<[batch] x ? x pos> max non-zeros per row (for ELLPACK)
-const Type maxNnzMemType = MemRefType::get(memrefShape, stt.getPosType());
+  const Type specType = StorageSpecifierType::get(stt.getEncoding());
+  // memref<[batch] x ? x pos>  positions
+  const Type posMemType = MemRefType::get(memrefShape, stt.getPosType());
+  // memref<[batch] x ? x crd>  coordinates
+  const Type crdMemType = MemRefType::get(memrefShape, stt.getCrdType());
+  // memref<[batch] x ? x eltType> values
+  const Type valMemType = MemRefType::get(memrefShape, stt.getElementType());
+  // memref<[batch] x ? x pos> max non-zeros per row (for ELLPACK)
+  const Type maxNnzMemType = MemRefType::get(memrefShape, stt.getPosType());
 
 StorageLayout(stt).foreachField([specType, posMemType, crdMemType, valMemType, maxNnzMemType,
                                  callback](FieldIndex fieldIdx,
                                            SparseTensorFieldKind fieldKind,
-                                           Level lvl, LevelType lt) -> bool {
-  switch (fieldKind) {
-  case SparseTensorFieldKind::StorageSpec:
-    return callback(specType, fieldIdx, fieldKind, lvl, lt);
-  case SparseTensorFieldKind::PosMemRef:
-    return callback(posMemType, fieldIdx, fieldKind, lvl, lt);
-  case SparseTensorFieldKind::CrdMemRef:
-    return callback(crdMemType, fieldIdx, fieldKind, lvl, lt);
-  case SparseTensorFieldKind::ValMemRef:
-    return callback(valMemType, fieldIdx, fieldKind, lvl, lt);
-  case SparseTensorFieldKind::MaxNnzMemRef:
-    return callback(maxNnzMemType, fieldIdx, fieldKind, lvl, lt);
-  };
-  llvm_unreachable("unrecognized field kind");
-});
+                 Level lvl, LevelType lt) -> bool {
+        switch (fieldKind) {
+        case SparseTensorFieldKind::StorageSpec:
+          return callback(specType, fieldIdx, fieldKind, lvl, lt);
+        case SparseTensorFieldKind::PosMemRef:
+          return callback(posMemType, fieldIdx, fieldKind, lvl, lt);
+        case SparseTensorFieldKind::CrdMemRef:
+          return callback(crdMemType, fieldIdx, fieldKind, lvl, lt);
+        case SparseTensorFieldKind::ValMemRef:
+          return callback(valMemType, fieldIdx, fieldKind, lvl, lt);
+        case SparseTensorFieldKind::MaxNnzMemRef:
+          return callback(maxNnzMemType, fieldIdx, fieldKind, lvl, lt);
+        };
+        llvm_unreachable("unrecognized field kind");
+      });
 }
 
 unsigned StorageLayout::getNumFields() const {
@@ -391,7 +391,7 @@ SparseTensorEncodingAttr SparseTensorEncodingAttr::withDimSlices(
     ArrayRef<SparseTensorDimSliceAttr> dimSlices) const {
   return SparseTensorEncodingAttr::get(
       getContext(), getLvlTypes(), getDimToLvl(), getLvlToDim(), getPosWidth(),
-      getCrdWidth(), getExplicitVal(), getImplicitVal(), dimSlices);
+      getCrdWidth(), getExplicitVal(), getImplicitVal(), dimSlices, getELLBlockSize(), getELLCols(), getBellIdxType(), getBellIdxBase());
 }
 
 SparseTensorEncodingAttr SparseTensorEncodingAttr::withoutDimSlices() const {
@@ -717,7 +717,7 @@ Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
   }
   return parser.getChecked<SparseTensorEncodingAttr>(
       parser.getContext(), lvlTypes, dimToLvl, lvlToDim, posWidth, crdWidth,
-      explicitVal, implicitVal, dimSlices);
+      explicitVal, implicitVal, dimSlices, 0, 0, 0, 0);
 }
 
 void SparseTensorEncodingAttr::print(AsmPrinter &printer) const {
@@ -792,7 +792,7 @@ LogicalResult SparseTensorEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, ArrayRef<LevelType> lvlTypes,
     AffineMap dimToLvl, AffineMap lvlToDim, unsigned posWidth,
     unsigned crdWidth, Attribute explicitVal, Attribute implicitVal,
-    ArrayRef<SparseTensorDimSliceAttr> dimSlices) {
+    ArrayRef<SparseTensorDimSliceAttr> dimSlices, unsigned blockSize, unsigned ellCols, unsigned idxType, unsigned idxBase) {
   if (!acceptBitWidth(posWidth))
     return emitError() << "unexpected position bitwidth: " << posWidth;
   if (!acceptBitWidth(crdWidth))
@@ -914,7 +914,8 @@ LogicalResult SparseTensorEncodingAttr::verifyEncoding(
   // level-rank is coherent across all the fields.
   if (failed(verify(emitError, getLvlTypes(), getDimToLvl(), getLvlToDim(),
                     getPosWidth(), getCrdWidth(), getExplicitVal(),
-                    getImplicitVal(), getDimSlices())))
+                    getImplicitVal(), getDimSlices(), getELLBlockSize(),
+                    getELLCols(), getBellIdxType(), getBellIdxBase())))
     return failure();
   // Check integrity with tensor type specifics.  In particular, we
   // need only check that the dimension-rank of the tensor agrees with
@@ -1228,7 +1229,7 @@ getNormalizedEncodingForSpecifier(SparseTensorEncodingAttr enc) {
       0, 0,
       Attribute(), // explicitVal (irrelevant to storage specifier)
       Attribute(), // implicitVal (irrelevant to storage specifier)
-      enc.getDimSlices());
+      enc.getDimSlices(), enc.getELLBlockSize(), enc.getELLCols(), enc.getBellIdxType(), enc.getBellIdxBase());
 }
 
 StorageSpecifierType

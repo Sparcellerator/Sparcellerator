@@ -360,29 +360,38 @@ def SparseTensorEncodingAttr : SparseTensor_Attr<"SparseTensorEncoding",
     ArrayRefParameter<
       "::mlir::sparse_tensor::SparseTensorDimSliceAttr",
       "per dimension slice metadata"
-      >: $dimSlices
+      >: $dimSlices,
+    "unsigned":$ELLBlockSize,
+    "unsigned":$ELLCols,
+    "unsigned":$BellIdxType,  // 0=32-bit, 1=64-bit
+    "unsigned":$BellIdxBase    // 0=zero, 1=one
   );
 
   let builders = [
-    AttrBuilder<(ins "ArrayRef<::mlir::sparse_tensor::LevelType>":$lvlTypes,
-                     CArg<"AffineMap", "{}">:$dimToLvl,
-                     CArg<"AffineMap", "{}">:$lvlToDim,
-                     CArg<"unsigned", "0">:$posWidth,
-                     CArg<"unsigned", "0">:$crdWidth,
-                     CArg<"::mlir::Attribute", "{}">:$explicitVal,
-                     CArg<"::mlir::Attribute", "{}">:$implicitVal), [{
-      if (!dimToLvl) {
-        dimToLvl = ::mlir::AffineMap::getMultiDimIdentityMap(lvlTypes.size(), $_ctxt);
-      }
-      if (!lvlToDim) {
-        lvlToDim = ::mlir::sparse_tensor::inferLvlToDim(dimToLvl, $_ctxt);
-      }
-      return $_get($_ctxt, lvlTypes, dimToLvl, lvlToDim, posWidth, crdWidth,
-        explicitVal, implicitVal,
-        ArrayRef<::mlir::sparse_tensor::SparseTensorDimSliceAttr>{});
+  AttrBuilder<(ins "ArrayRef<::mlir::sparse_tensor::LevelType>":$lvlTypes,
+                   CArg<"AffineMap", "{}">:$dimToLvl,
+                   CArg<"AffineMap", "{}">:$lvlToDim,
+                   CArg<"unsigned", "0">:$posWidth,
+                   CArg<"unsigned", "0">:$crdWidth,
+                   CArg<"::mlir::Attribute", "{}">:$explicitVal,
+                   CArg<"::mlir::Attribute", "{}">:$implicitVal,
+                   CArg<"unsigned", "0">:$ELLBlockSize,
+                   CArg<"unsigned", "0">:$ELLCols,
+                   CArg<"unsigned", "0">:$BellIdxType,
+                   CArg<"unsigned", "0">:$BellIdxBase), [{
+    if (!dimToLvl) {
+      dimToLvl = ::mlir::AffineMap::getMultiDimIdentityMap(lvlTypes.size(), $_ctxt);
+    }
+    if (!lvlToDim) {
+      lvlToDim = ::mlir::sparse_tensor::inferLvlToDim(dimToLvl, $_ctxt);
+    }
+    return $_get($_ctxt, lvlTypes, dimToLvl, lvlToDim, posWidth, crdWidth,
+      explicitVal, implicitVal,
+      ArrayRef<::mlir::sparse_tensor::SparseTensorDimSliceAttr>{},
+      ELLBlockSize, ELLCols, BellIdxType, BellIdxBase);
     }]>
   ];
-
+  
   let extraClassDeclaration = [{
     //
     // Factory methods.

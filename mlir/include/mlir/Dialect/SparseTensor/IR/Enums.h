@@ -159,7 +159,7 @@ enum class LevelFormat : uint64_t {
   Singleton = 0x00080000,
   LooseCompressed = 0x00100000,
   NOutOfM = 0x00200000,
-  ELLPACK = 0x00400000,  // New: ELLPACK format
+  BELLPACK = 0x00400000, // New: BELLPACK format
 };
 
 constexpr bool encPowOfTwo(LevelFormat fmt) {
@@ -197,7 +197,7 @@ constexpr const char *toFormatString(LevelFormat lvlFmt) {
     return "loose_compressed";
   case LevelFormat::NOutOfM:
     return "structured";
-  case LevelFormat::ELLPACK:
+  case LevelFormat::BELLPACK:
     return "ellpack";
   }
   return "";
@@ -208,6 +208,8 @@ enum class LevelPropNonDefault : uint64_t {
   Nonunique = 0x0001,  // 0b001
   Nonordered = 0x0002, // 0b010
   SoA = 0x0004,        // 0b100
+  Blocked = 0x0008,    // 0b1000 - Indicates block-based storage
+  FixedColumns = 0x0010   // 0b10000 - Fixed number of columns per row (ELLPACK style)
 };
 
 /// Returns string representation of the given level properties.
@@ -219,9 +221,14 @@ constexpr const char *toPropString(LevelPropNonDefault lvlProp) {
     return "nonordered";
   case LevelPropNonDefault::SoA:
     return "soa";
+  case LevelPropNonDefault::Blocked:
+    return "blocked";
+  case LevelPropNonDefault::FixedColumns:
+    return "fixedcolumns";
   }
-  return "";
+  return "unknown"; // Handle any unexpected cases
 }
+
 
 /// This enum defines all the sparse representations supportable by
 /// the SparseTensor dialect. We use a lightweight encoding to encode
@@ -240,17 +247,51 @@ constexpr const char *toPropString(LevelPropNonDefault lvlProp) {
 
 struct LevelType {
 public:
+  std::string getPropString() const {
+    std::string propStr = "";
+    if (isa<LevelPropNonDefault::Nonunique>())
+      propStr += toPropString(LevelPropNonDefault::Nonunique);
+
+    if (isa<LevelPropNonDefault::Nonordered>()) {
+      if (!propStr.empty())
+        propStr += ", ";
+      propStr += toPropString(LevelPropNonDefault::Nonordered);
+    }
+
+    if (isa<LevelPropNonDefault::SoA>()) {
+      if (!propStr.empty())
+        propStr += ", ";
+      propStr += toPropString(LevelPropNonDefault::SoA);
+    }
+
+    // Add any new properties here
+
+    return propStr.empty() ? "" : "(" + propStr + ")";
+  }
+  // Modified bit layout for BELLPACK:
+  // ----------------------------------------------------
+  // | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
+  // ----------------------------------------------------
+  // For BELLPACK format only, repurpose the upper 32 bits
   /// Check that the `LevelType` contains a valid (possibly undefined) value.
   static constexpr bool isValidLvlBits(uint64_t lvlBits) {
     auto fmt = static_cast<LevelFormat>(lvlBits & 0xffff0000);
     const uint64_t propertyBits = lvlBits & 0xffff;
+
+    if (fmt == LevelFormat::BELLPACK) {
+      const uint64_t blockSize = (lvlBits >> 32) & 0xffff;
+      const uint64_t ellCols = (lvlBits >> 48) & 0xffff;
+      return blockSize > 0 && ellCols > 0;
+    }
+
     // If undefined/dense/batch/NOutOfM, then must be unique and ordered.
     // Otherwise, the format must be one of the known ones.
     return (isAnyOfFmt<LevelFormat::Undef, LevelFormat::Dense,
                        LevelFormat::Batch, LevelFormat::NOutOfM>(fmt))
                ? (propertyBits == 0)
                : (isAnyOfFmt<LevelFormat::Compressed, LevelFormat::Singleton,
-                             LevelFormat::LooseCompressed, LevelFormat::ELLPACK>(fmt));
+                             LevelFormat::LooseCompressed,
+                             LevelFormat::BELLPACK>(fmt));
   }
 
   /// Convert a LevelFormat to its corresponding LevelType with the given
@@ -270,6 +311,16 @@ public:
     return isValidLvlBits(ltBits) ? std::optional(LevelType(ltBits))
                                   : std::nullopt;
   }
+  static std::optional<LevelType> buildBELLLvlType(uint64_t blockSize,
+                                                   uint64_t ellCols) {
+    assert(blockSize <= 0xffff && ellCols <= 0xffff);
+    uint64_t ltBits = static_cast<uint64_t>(LevelFormat::BELLPACK);
+    ltBits |= (blockSize << 32) | (ellCols << 48);
+
+    return isValidLvlBits(ltBits) ? std::optional(LevelType(ltBits))
+                                  : std::nullopt;
+  }
+
   static std::optional<LevelType> buildLvlType(LevelFormat lf, bool ordered,
                                                bool unique, uint64_t n = 0,
                                                uint64_t m = 0) {
@@ -338,10 +389,11 @@ public:
 
   /// Check if the `LevelType` is considered to be sparse.
   constexpr bool hasSparseSemantic() const {
-    return isa<LevelFormat::Compressed, LevelFormat::Singleton, 
-               LevelFormat::LooseCompressed, LevelFormat::NOutOfM, LevelFormat::ELLPACK>();
+    return isa<LevelFormat::Compressed, LevelFormat::Singleton,
+               LevelFormat::LooseCompressed, LevelFormat::NOutOfM,
+               LevelFormat::BELLPACK>();
   }
-  
+
   /// Check if the `LevelType` is considered to be dense-like.
   constexpr bool hasDenseSemantic() const {
     return isa<LevelFormat::Dense, LevelFormat::Batch>();
@@ -350,9 +402,10 @@ public:
   /// Check if the `LevelType` needs positions array.
   constexpr bool isWithPosLT() const {
     assert(!isa<LevelFormat::Undef>());
-    return isa<LevelFormat::Compressed, LevelFormat::LooseCompressed, LevelFormat::ELLPACK>();
+    return isa<LevelFormat::Compressed, LevelFormat::LooseCompressed,
+               LevelFormat::BELLPACK>();
   }
-  
+
   /// Check if the `LevelType` needs coordinates array.
   constexpr bool isWithCrdLT() const {
     assert(!isa<LevelFormat::Undef>());
@@ -362,20 +415,21 @@ public:
 
   /// Check if the `LevelType` is ordered.
   constexpr bool isOrdered() const {
-    // ELLPACK has a defined order similar to Compressed
-    return isa<LevelFormat::Dense, LevelFormat::Compressed, LevelFormat::ELLPACK>();
+    // BELLPACK has a defined order similar to Compressed
+    return isa<LevelFormat::Dense, LevelFormat::Compressed,
+               LevelFormat::BELLPACK>();
   }
 
   /// Check if the `LevelType` is a singleton type.
   constexpr bool isSingletonLT() const {
-    // ELLPACK is not a singleton type
+    // BELLPACK is not a singleton type
     return isa<LevelFormat::Singleton, LevelFormat::NOutOfM>();
   }
 
   /// Get number of arrays needed for this level type.
   constexpr unsigned getNumArrays() const {
-    if (isa<LevelFormat::ELLPACK>())
-      return 3; // ELLPACK uses position, coordinate, and max per row arrays
+    if (isa<LevelFormat::BELLPACK>())
+      return 3; // BELLPACK uses position, coordinate, and max per row arrays
     return hasDenseSemantic() ? 0 : (isWithPosLT() ? 2 : 1);
   }
 
@@ -386,6 +440,11 @@ public:
   std::string toMLIRString() const {
     std::string lvlStr = toFormatString(getLvlFmt());
     std::string propStr = "";
+
+    if (isa<LevelFormat::BELLPACK>()) {
+      return std::string("NEED TO FIX toMLIRString for BELLPACK");
+    }
+
     if (isa<LevelFormat::NOutOfM>()) {
       lvlStr +=
           "[" + std::to_string(getN()) + ", " + std::to_string(getM()) + "]";
@@ -407,6 +466,14 @@ public:
       lvlStr += ("(" + propStr + ")");
     return lvlStr;
   }
+  constexpr bool isBELL() const { return isa<LevelFormat::BELLPACK>(); }
+
+  constexpr bool isBlocked() const { return isa<LevelPropNonDefault::Blocked>(); }
+
+  constexpr bool isFixedColumn() const {
+    return isa<LevelPropNonDefault::FixedColumns>();
+}
+
 
 private:
   /// Bit manipulations for LevelType:
@@ -452,7 +519,9 @@ inline bool isUniqueLT(LevelType lt) {
 }
 inline bool isWithCrdLT(LevelType lt) { return lt.isWithCrdLT(); }
 inline bool isWithPosLT(LevelType lt) { return lt.isWithPosLT(); }
-inline bool isEllpackLT(LevelType lt) { return lt.isa<LevelFormat::ELLPACK>(); }
+inline bool isEllpackLT(LevelType lt) {
+  return lt.isa<LevelFormat::BELLPACK>();
+}
 inline bool isValidLT(LevelType lt) {
   return LevelType::isValidLvlBits(static_cast<uint64_t>(lt));
 }

@@ -121,6 +121,30 @@ public:
     return withEncoding(enc.withoutDimSlices());
   }
 
+  unsigned getELLBlockSize() const {
+    return enc.getELLBlockSize();
+  }
+
+  unsigned getELLCols() const {
+    return enc.getELLCols();
+  }
+
+  unsigned getBellIdxType() const {
+    return enc.getBellIdxType();
+  }
+
+  unsigned getBellIdxBase() const {
+    return enc.getBellIdxBase();
+  }
+
+  bool isBELL() const {
+    return getELLBlockSize() > 0 && 
+           getELLCols() > 0 && 
+           (getBellIdxType() == 0 || getBellIdxType() == 1) && 
+           (getBellIdxBase() == 0 || getBellIdxBase() == 1);
+  }
+  
+
   /// Allow implicit conversion to `RankedTensorType`, `ShapedType`,
   /// and `Type`.  These are implicit to help alleviate the impedance
   /// mismatch for code that has not been converted to use `SparseTensorType`

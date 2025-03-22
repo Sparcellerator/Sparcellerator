@@ -74,7 +74,7 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
   } else if (base == "singleton") {
     properties |= static_cast<uint64_t>(LevelFormat::Singleton);
   } else if (base == "ellpack") {
-    properties |= static_cast<uint64_t>(LevelFormat::ELLPACK);
+    properties |= static_cast<uint64_t>(LevelFormat::BELLPACK);
   } else {
     parser.emitError(loc, "unknown level format: ") << base;
     return failure();

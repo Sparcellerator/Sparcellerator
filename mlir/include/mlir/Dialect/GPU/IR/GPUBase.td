@@ -131,7 +131,32 @@ class GPU_SparseHandle<string typeStr, string description> :
 def GPU_SparseDnTensorHandle : GPU_SparseHandle<"SparseDnTensorHandleType", "dense tensor">;
 def GPU_SparseSpGEMMOpHandle : GPU_SparseHandle<"SparseSpGEMMOpHandleType", "SpGEMM operation">;
 def GPU_SparseSpMatHandle : GPU_SparseHandle<"SparseSpMatHandleType", "sparse matrix">;
-def GPU_ELLDescriptorHandle : GPU_SparseHandle<"ELLDescriptorHandleType", "ELL descriptor">;
+def GPU_BELLDescriptorHandle : GPU_SparseHandle<"BELLDescriptorHandleType", "BELL descriptor">;
+
+def GPU_BELLParamsAttr : AttrDef<GPU_Dialect, "BellParams"> {
+  let mnemonic = "bell_params";
+  let parameters = (ins
+    "int":$blockSize,
+    "int":$ellCols,
+    "int":$idxType,
+    "int":$idxBase
+  );
+  let assemblyFormat = "`<` $blockSize `,` $ellCols `,` $idxType `,` $idxBase `>`";
+}
+
+def GPU_BellIndexType : GPU_I32Enum<"BellIndexType", "Blocked-ELL index type", [
+  I32EnumAttrCase<"I32", 0, "i32">,
+  I32EnumAttrCase<"I64", 1, "i64">
+]>;
+
+def GPU_BellIndexBase : GPU_I32Enum<"BellIndexBase", "Blocked-ELL index base", [
+  I32EnumAttrCase<"Zero", 0, "zero">,
+  I32EnumAttrCase<"One", 1, "one">
+]>;
+
+def GPU_BellIndexTypeAttr : GPU_I32EnumAttr<"bell_index_type", GPU_BellIndexType>;
+def GPU_BellIndexBaseAttr : GPU_I32EnumAttr<"bell_index_base", GPU_BellIndexBase>;
+
 //===----------------------------------------------------------------------===//
 // GPU Interfaces.
 //===----------------------------------------------------------------------===//

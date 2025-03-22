@@ -40,7 +40,8 @@ enum class CuSparseFormat {
   kCSR,
   kCSC,
   kBSR,
-  kELLPACK, // Add this new format
+  kELLPACK,
+  kBELL, // Add Blocked-ELLPACK format
 };
 
 //===----------------------------------------------------------------------===//
@@ -370,7 +371,7 @@ static bool matchSumOfMultOfArgs(linalg::GenericOp op) {
   return false;
 }
 
-// Helper to detect c += spy(s) x (a * b)
+/// Helper to detect c += spy(s) x (a * b)
 static bool matchSumReductionOfMulUnary(linalg::GenericOp op) {
   auto yieldOp = cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
   // The linalg yields a custom reduce result.
@@ -455,6 +456,21 @@ static bool isAdmissibleELLPACK(SparseTensorType &aTp) {
          aTp.isOrderedLvl(1) && aTp.isUniqueLvl(1) && isAdmissibleMetaData(aTp);
 }
 
+/// Test for Blocked-ELLPACK matrix with suitable metadata.
+static bool isAdmissibleBELL(SparseTensorType &aTp) {
+  // Check if this is a BELL format tensor
+  if (aTp.getDimRank() == 2 && aTp.getLvlRank() == 2) {
+    auto enc = aTp.getEncoding();
+    // Check for BELL-specific structure in the encoding
+    bool hasBellEncoding = enc.getELLBlockSize() > 0 && enc.getELLCols() > 0;
+
+    // Additionally check for level types compatible with BELL
+    return hasBellEncoding && aTp.isDenseLvl(0) &&
+           aTp.isBELL() && aTp.isOrderedLvl(1) &&
+           aTp.isUniqueLvl(1) && isAdmissibleMetaData(aTp);
+  }
+  return false;
+}
 /// Test for 2:4 matrix with suitable metadata.
 static bool isAdmissible24(SparseTensorType &aTp) {
   return aTp.getDimRank() == 2 && aTp.getLvlRank() == 3 && aTp.isDenseLvl(0) &&
@@ -488,6 +504,8 @@ static CuSparseFormat getCuSparseFormat(SparseTensorType aTp,
 #else
     return enableRT ? CuSparseFormat::kCOO : CuSparseFormat::kNone;
 #endif
+  if (isAdmissibleBELL(aTp))
+    return CuSparseFormat::kBELL;
   if (isAdmissibleELLPACK(aTp))
     return CuSparseFormat::kELLPACK;
   if (isAdmissibleCSR(aTp))
@@ -551,6 +569,30 @@ static Operation *genSpMat(OpBuilder &builder, Location loc,
     return builder.create<gpu::CreateCscOp>(loc, handleTp, tokenTp, token, sz1,
                                             sz2, nseA, rowA, colA, valA);
 
+  if (format == CuSparseFormat::kBELL) {
+    // Get blocked ELLPACK parameters
+    auto enc = aTp.getEncoding();
+    unsigned blockSize = enc.getELLBlockSize();
+    unsigned ellCols = enc.getELLCols();
+  
+    // Default values if not specified
+    if (blockSize == 0)
+      blockSize = 1;
+    if (ellCols == 0)
+      ellCols = 16; // Reasonable default
+  
+    // Create BELL format descriptor
+    return builder
+        .create<gpu::CreateBlockedELLOp>(
+            loc, handleTp, tokenTp, token, sz1, sz2,
+            constantIndex(builder, loc, blockSize),
+            constantIndex(builder, loc, ellCols), colA, valA,
+            builder.getAttr<gpu::BellIndexTypeAttr>(gpu::BellIndexType::I32), // CUSPARSE_INDEX_32I
+            builder.getAttr<gpu::BellIndexBaseAttr>(gpu::BellIndexBase::Zero), // CUSPARSE_INDEX_BASE_ZERO
+            TypeAttr::get(aTp.getElementType()))
+        .getOperation();
+  }
+                                            
   if (format == CuSparseFormat::kELLPACK) {
     // Get maxNnzPerRow from the first position (holds special data for ELLPACK)
     Value maxNnzPerRow = builder.create<memref::LoadOp>(
@@ -676,7 +718,7 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
   if (format == CuSparseFormat::kELLPACK) {
     // Create ELLPACK descriptor
     auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
-        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        loc, rewriter.getType<gpu::BELLDescriptorHandleType>(), token,
         maxNnzPerRow, szY);
     Value ellDescVal = ellDesc.getResult();
     token = ellDesc.getAsyncToken();
@@ -693,7 +735,7 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
         /*computeType=*/dnYType, buffer, ellBufVal);
 
     // Clean up ELLPACK resources
-    token = spmvComp->getResult(0).cast<Value>();
+    token = mlir::cast<Value>(spmvComp->getResult(0));
     token = rewriter
                 .create<gpu::DestroyELLDescriptorOp>(loc, tokenTp, token,
                                                      ellDescVal)
@@ -728,6 +770,27 @@ static LogicalResult rewriteSpMV(PatternRewriter &rewriter,
   // Done.
   rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(op, memY);
   return success();
+}
+
+static Value genBlockedELLDescriptor(OpBuilder &builder, Location loc,
+                                     Value token, SparseTensorType aTp,
+                                     Value rows, Value cols, Value colIndices,
+                                     Value values) {
+  // Extract BELL parameters from sparse tensor type
+  auto enc = aTp.getEncoding();
+  auto blockSize = enc.getELLBlockSize();
+  auto ellCols = enc.getELLCols();
+
+  // Create descriptor operation
+  auto descOp = builder.create<gpu::CreateBlockedELLOp>(
+      loc, builder.getType<gpu::SparseSpMatHandleType>(), token, rows, cols,
+      constantIndex(builder, loc, blockSize),
+      constantIndex(builder, loc, ellCols), colIndices, values,
+      builder.getAttr<gpu::BellIndexTypeAttr>(gpu::BellIndexType::I32),
+      builder.getAttr<gpu::BellIndexBaseAttr>(gpu::BellIndexBase::Zero),
+      TypeAttr::get(aTp.getElementType()));
+
+  return descOp.getResult(0);
 }
 
 /// Match and rewrite SpMM kernel.
@@ -783,6 +846,96 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
         loc, memR, constantIndex(rewriter, loc, 0));
   }
 
+  // Special handling for BELL format
+  if (format == CuSparseFormat::kBELL) {
+    // Create dense tensor handles
+    auto dmatB = rewriter.create<gpu::CreateDnTensorOp>(
+        loc, dnTensorHandleTp, tokenTp, token, matB,
+        SmallVector<Value>{szk, szn});
+    Value dnB = dmatB.getResult(0);
+    token = dmatB.getAsyncToken();
+
+    auto dmatC = rewriter.create<gpu::CreateDnTensorOp>(
+        loc, dnTensorHandleTp, tokenTp, token, matC,
+        SmallVector<Value>{szm, szn});
+    Value dnC = dmatC.getResult(0);
+    token = dmatC.getAsyncToken();
+
+    // Create BELL descriptor directly
+    auto descOp = rewriter.create<gpu::CreateBlockedELLOp>(
+      loc, 
+      rewriter.getType<gpu::SparseSpMatHandleType>(),
+      tokenTp, 
+      token,
+      szm, szk, 
+      constantIndex(rewriter, loc, aTp.getELLBlockSize()),
+      constantIndex(rewriter, loc, aTp.getELLCols()),
+      colA, valA,
+      rewriter.getAttr<gpu::BellIndexTypeAttr>(gpu::BellIndexType::I32),
+      rewriter.getAttr<gpu::BellIndexBaseAttr>(gpu::BellIndexBase::Zero),
+      TypeAttr::get(aTp.getElementType())
+    );
+  
+    Value spMatA = descOp.getResult(0);
+    token = descOp.getAsyncToken(); // CORRECT token update
+
+    // Get compute type
+    auto dnCType = llvm::cast<MemRefType>(matC.getType()).getElementType();
+
+    // Precompute buffer size for SpMM
+    auto mode = gpu::TransposeMode::NON_TRANSPOSE;
+    auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
+      loc, 
+      /*resultTypes=*/TypeRange{indexTp, tokenTp},
+      /*asyncDependencies=*/token,
+      /*modeA=*/rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+      /*modeB=*/rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+      /*matA=*/spMatA,
+      /*matB=*/dnB,
+      /*matC=*/dnC,
+      /*computeType=*/TypeAttr::get(dnCType));
+
+    Value bufferSz = bufferComp.getResult(0);
+    token = bufferComp.getAsyncToken();
+
+    auto buf = genAllocBuffer(rewriter, loc, bufferSz, token);
+    Value buffer = buf.getResult(0);
+    token = buf.getAsyncToken();
+
+    // Call SpMM
+    auto spmmOp = rewriter.create<gpu::SpMMOp>(
+        loc, tokenTp, token,
+        rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+        rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+        spMatA, dnB, dnC,
+        TypeAttr::get(dnCType), buffer);
+
+    token = spmmOp.getAsyncToken();
+
+    // Copy data back to host and free all resources
+    token = rewriter.create<gpu::DestroySpMatOp>(loc, tokenTp, token, spMatA)
+                .getAsyncToken();
+    token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnB)
+                .getAsyncToken();
+    token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnC)
+                .getAsyncToken();
+    token = genDeallocMemRef(rewriter, loc, rowA, token);
+    if (colA)
+      token = genDeallocMemRef(rewriter, loc, colA, token);
+    token = genDeallocMemRef(rewriter, loc, valA, token);
+    token = genDeallocMemRef(rewriter, loc, buffer, token);
+    token = genDeallocMemRef(rewriter, loc, matB, token);
+    token = genCopyMemRef(rewriter, loc, bufC, matC, token);
+    token = genDeallocMemRef(rewriter, loc, matC, token);
+    tokens.push_back(token);
+    genBlockingWait(rewriter, loc, tokens);
+    tokens.clear();
+
+    // Done.
+    rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(op, bufC);
+    return success();
+  }
+
   Operation *spGenA =
       genSpMat(rewriter, loc, aTp, spMatHandleTp, tokenTp, token, szm, szk,
                nseA, rowA, colA, valA, format, enableRT);
@@ -801,9 +954,17 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
   auto dnCType = llvm::cast<MemRefType>(c.getType()).getElementType();
 
   // Precompute buffersize for SpMM.
+  auto mode = gpu::TransposeMode::NON_TRANSPOSE;
   auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
-      loc, indexTp, tokenTp, token, spMatA, dnB, dnC,
-      /*computeType=*/dnCType);
+    loc, 
+    /*resultTypes=*/TypeRange{indexTp, tokenTp},
+    /*asyncDependencies=*/token,
+    /*modeA=*/rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+    /*modeB=*/rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+    /*matA=*/spMatA,
+    /*matB=*/dnB,
+    /*matC=*/dnC,
+    /*computeType=*/TypeAttr::get(dnCType));
   Value bufferSz = bufferComp.getResult(0);
   token = bufferComp.getAsyncToken();
   auto buf = genAllocBuffer(rewriter, loc, bufferSz, token);
@@ -815,7 +976,7 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
   if (format == CuSparseFormat::kELLPACK) {
     // Create ELLPACK descriptor
     auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
-        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        loc, rewriter.getType<gpu::BELLDescriptorHandleType>(), token,
         maxNnzPerRow, szm);
     Value ellDescVal = ellDesc.getResult();
     token = ellDesc.getAsyncToken();
@@ -1110,12 +1271,15 @@ static LogicalResult rewrite2To4SpMM(PatternRewriter &rewriter,
   auto dmatCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
 
   // Precompute buffersize for SpMM.
+  auto mode = gpu::TransposeMode::NON_TRANSPOSE;
   SmallVector<Type> bufferTypes_{indexTp, indexTp, indexTp};
   TypeRange bufferTypes(bufferTypes_);
   auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
-      loc, bufferTypes, tokenTp, token, gpu::TransposeMode::NON_TRANSPOSE,
-      gpu::TransposeMode::NON_TRANSPOSE, spMatA, dnB, dnC,
-      /*computeType=*/dmatCType);
+      loc, bufferTypes, tokenTp, token, 
+      rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+      rewriter.getAttr<gpu::TransposeModeAttr>(mode),
+       spMatA, dnB, dnC,
+      /*computeType=*/TypeAttr::get(dmatCType));
   token = bufferComp.getAsyncToken();
 
   // Allocate buffers on host.
@@ -1253,7 +1417,7 @@ static LogicalResult rewriteSDDMM(PatternRewriter &rewriter,
   if (format == CuSparseFormat::kELLPACK) {
     // Create ELLPACK descriptor
     auto ellDesc = rewriter.create<gpu::CreateELLDescriptorOp>(
-        loc, rewriter.getType<gpu::ELLDescriptorHandleType>(), token,
+        loc, rewriter.getType<gpu::BELLDescriptorHandleType>(), token,
         maxNnzPerRow, szm);
     Value ellDescVal = ellDesc.getResult();
     token = ellDesc.getAsyncToken();

@@ -207,7 +207,7 @@ void GPUDialect::initialize() {
   addTypes<SparseDnTensorHandleType>();
   addTypes<SparseSpMatHandleType>();
   addTypes<SparseSpGEMMOpHandleType>();
-  addTypes<ELLDescriptorHandleType>();
+  addTypes<BELLDescriptorHandleType>();
   addOperations<
 #define GET_OP_LIST
 #include "mlir/Dialect/GPU/IR/GPUOps.cpp.inc"

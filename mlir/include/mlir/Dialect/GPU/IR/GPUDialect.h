@@ -206,16 +206,16 @@ public:
 };
 
 /// Descriptor for ELLPACK format sparse matrices.
-class ELLDescriptorHandleType : 
-  public Type::TypeBase<ELLDescriptorHandleType, Type, TypeStorage> {
+class BELLDescriptorHandleType : 
+  public Type::TypeBase<BELLDescriptorHandleType, Type, TypeStorage> {
 public:
   using Base::Base;
-  static ELLDescriptorHandleType get(MLIRContext *context) {
+  static BELLDescriptorHandleType get(MLIRContext *context) {
     return Base::get(context);
   }
 
   // Add this line to define the static 'name' member
-  static constexpr const char *name = "ELLDescriptorHandle";
+  static constexpr const char *name = "BELLDescriptorHandle";
 };
 
 } // namespace gpu

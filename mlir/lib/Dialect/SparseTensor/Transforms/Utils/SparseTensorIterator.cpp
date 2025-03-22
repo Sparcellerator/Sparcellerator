@@ -1603,7 +1603,7 @@ sparse_tensor::makeSparseTensorLevel(LevelType lt, Value sz, ValueRange b,
     return std::make_unique<SingletonLevel>(t, l, lt, sz, b[0]);
   case LevelFormat::NOutOfM:
     return std::make_unique<NOutOfMLevel>(t, l, lt, sz, b[0]);
-  case LevelFormat::ELLPACK:
+  case LevelFormat::BELLPACK:
     return std::make_unique<ELLPACKLevel>(t, l, lt, sz, b[0], b[1]);
   case LevelFormat::Undef:
     llvm_unreachable("undefined level format");

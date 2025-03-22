@@ -2044,7 +2044,7 @@ def GPU_SpMVELLOp : GPU_Op<"spmv_ell", []> {
   let arguments = (ins
     GPU_AsyncToken:$token,
     GPU_SparseSpMatHandle:$spMatrix,
-    GPU_ELLDescriptorHandle:$ellDescriptor,
+    GPU_BELLDescriptorHandle:$ellDescriptor,
     GPU_SparseDnTensorHandle:$denseVectorX,
     GPU_SparseDnTensorHandle:$denseVectorY,
     TypeAttr:$computeType,
@@ -2066,7 +2066,7 @@ def GPU_DestroyELLDescriptorOp : GPU_Op<"destroy_ell_descriptor", []> {
   
   let arguments = (ins
     GPU_AsyncToken:$token,
-    GPU_ELLDescriptorHandle:$ellDescriptor
+    GPU_BELLDescriptorHandle:$ellDescriptor
   );
   
   let results = (outs
@@ -2425,7 +2425,7 @@ def GPU_CreateELLDescriptorOp : GPU_Op<"create_ell_descriptor", []> {
   );
   
   let results = (outs
-    GPU_ELLDescriptorHandle:$result,
+    GPU_BELLDescriptorHandle:$result,
     GPU_AsyncToken:$async_token
   );
 }
@@ -2663,7 +2663,7 @@ def GPU_SpMMELLOp : GPU_Op<"spmm_ell", [GPU_AsyncOpInterface]> {
   let arguments = (ins
     Variadic<GPU_AsyncToken>:$asyncDependencies,
     GPU_SparseSpMatHandle:$spMatrix,
-    GPU_ELLDescriptorHandle:$ellDescriptor,
+    GPU_BELLDescriptorHandle:$ellDescriptor,
     GPU_SparseDnTensorHandle:$denseMatrixB,
     GPU_SparseDnTensorHandle:$denseMatrixC,
     TypeAttr:$computeType,
@@ -2712,7 +2712,7 @@ def GPU_SDDMMELLOp : GPU_Op<"sddmm_ell", [GPU_AsyncOpInterface]> {
     GPU_SparseDnTensorHandle:$denseMatrixA,
     GPU_SparseDnTensorHandle:$denseMatrixB,
     GPU_SparseSpMatHandle:$spMatrix,
-    GPU_ELLDescriptorHandle:$ellDescriptor,
+    GPU_BELLDescriptorHandle:$ellDescriptor,
     TypeAttr:$computeType,
     AnyMemRef:$buffer,
     AnyMemRef:$ellBuffer
@@ -3216,6 +3216,101 @@ def GPU_WarpExecuteOnLane0Op : GPU_Op<"warp_execute_on_lane_0",
     bool isDefinedOutsideOfRegion(Value value) {
       return !getRegion().isAncestor(value.getParentRegion());
     }
+  }];
+}
+
+///===----------------------------------------------------------------------===//
+// Blocked-ELL Sparse Matrix Operations 
+//===----------------------------------------------------------------------===//
+
+def GPU_CreateBlockedELLOp : GPU_Op<"create_blocked_ell", 
+    [GPU_AsyncOpInterface]> {
+  let summary = "Create Blocked-ELL sparse matrix descriptor";
+  let description = [{
+    Creates a Blocked-ELL matrix descriptor matching cuSPARSE's cusparseCreateBlockedEll.
+    
+    Example CUDA equivalent:
+    cusparseCreateBlockedEll(&matA, rows, cols, blockSize, ellCols,
+                            d_ellColInd, d_ellValues, idxType, idxBase, valueType);
+  }];
+
+  let arguments = (ins 
+    Variadic<GPU_AsyncToken>:$asyncDependencies,
+    Index:$rows,
+    Index:$cols,
+    Index:$blockSize,
+    Index:$ellCols,
+    AnyMemRef:$colIndices,
+    AnyMemRef:$values,
+    GPU_BellIndexTypeAttr:$idxType,
+    GPU_BellIndexBaseAttr:$idxBase,
+    TypeAttr:$valueType
+  );
+  
+  
+  let results = (outs 
+    GPU_BELLDescriptorHandle:$descriptor,
+    Optional<GPU_AsyncToken>:$asyncToken
+  );
+
+  let assemblyFormat = [{
+    custom<AsyncDependencies>(type($asyncToken), $asyncDependencies)
+    $rows `,` $cols `,` $blockSize `,` $ellCols `,` 
+    $colIndices `,` $values attr-dict `:` 
+    type($rows) `,` type($cols) `,` type($blockSize) `,` type($ellCols) `,`
+    type($colIndices) `,` type($values)
+  }];
+
+  let builders = [
+    OpBuilder<(ins 
+      "Value":$asyncToken,
+      "ValueRange":$asyncDependencies,
+      "Value":$rows,
+      "Value":$cols,
+      "Value":$blockSize,
+      "Value":$ellCols,
+      "Value":$colIndices,
+      "Value":$values,
+      "::mlir::gpu::BellIndexTypeAttr":$idxType,
+      "::mlir::gpu::BellIndexBaseAttr":$idxBase,
+      "TypeAttr":$valueType)>
+  ];
+
+}
+
+def GPU_DestroyBELLDescriptorOp : GPU_Op<"destroy_bell_descriptor", 
+    [GPU_AsyncOpInterface]> {
+  let summary = "Destroy Blocked-ELL descriptor";
+  let description = [{
+    Releases resources associated with a Blocked-ELL descriptor.
+    
+    Maps directly to cusparseDestroySpMat() in cuSPARSE:
+    cusparseDestroySpMat(matDescr);
+
+    This operation should be called to free resources when the descriptor
+    is no longer needed.
+
+    If the `async` keyword is present, the op is executed asynchronously and
+    returns a !gpu.async.token.
+
+    Example:
+    ```
+    %token = gpu.destroy_bell_descriptor async [%dep] %desc
+    ```
+  }];
+
+  let arguments = (ins 
+    Variadic<GPU_AsyncToken>:$asyncDependencies,
+    GPU_BELLDescriptorHandle:$matDescriptor
+  );
+  
+  let results = (outs 
+    Optional<GPU_AsyncToken>:$asyncToken
+  );
+
+  let assemblyFormat = [{
+    custom<AsyncDependencies>(type($asyncToken), $asyncDependencies)
+    $matDescriptor attr-dict
   }];
 }
 
