@@ -33,7 +33,8 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
   StringRef base;
   const auto loc = parser.getCurrentLocation();
   ERROR_IF(failed(parser.parseOptionalKeyword(&base)),
-           "expected valid level format (e.g. dense, compressed, singleton, or ellpack)")
+           "expected valid level format (e.g. dense, compressed, singleton, or "
+           "ellpack)")
   uint64_t properties = 0;
   SmallVector<unsigned> structured;
 
@@ -51,6 +52,23 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
       parser.emitError(loc, "expected n <= m in n_out_of_m");
       return failure();
     }
+  } else if (base == "blocked_ell") {
+    SmallVector<unsigned> params;
+    ParseResult res = parser.parseCommaSeparatedList(
+        mlir::OpAsmParser::Delimiter::OptionalSquare,
+        [&]() -> ParseResult { return parseStructured(parser, &params); },
+        " in blocked_ell parameters [blockSize, ellCols]");
+    FAILURE_IF_FAILED(res)
+    
+    if (params.size() != 2 || params[0] == 0 || params[1] == 0) {
+      parser.emitError(loc, "blocked_ell requires [blockSize>0, ellCols>0]");
+      return failure();
+    }
+    
+    auto lt = LevelType::buildBELLLvlType(params[0], params[1]);
+    if (!lt)
+      return failure();
+    return success(*lt);
   }
 
   ParseResult res = parser.parseCommaSeparatedList(
@@ -73,7 +91,7 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
     properties |= static_cast<uint64_t>(LevelFormat::LooseCompressed);
   } else if (base == "singleton") {
     properties |= static_cast<uint64_t>(LevelFormat::Singleton);
-  } else if (base == "ellpack") {
+  } else if (base == "blocked_ell") {
     properties |= static_cast<uint64_t>(LevelFormat::BELLPACK);
   } else {
     parser.emitError(loc, "unknown level format: ") << base;
@@ -84,7 +102,6 @@ FailureOr<uint64_t> LvlTypeParser::parseLvlType(AsmParser &parser) const {
            "invalid level type: level format doesn't support the properties");
   return properties;
 }
-
 
 ParseResult LvlTypeParser::parseProperty(AsmParser &parser,
                                          uint64_t *properties) const {

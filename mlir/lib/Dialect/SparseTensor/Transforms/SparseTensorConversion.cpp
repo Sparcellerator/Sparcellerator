@@ -105,6 +105,23 @@ static Value createOrFoldDimCall(OpBuilder &builder, Location loc,
   const Size sz = stt.getDynamicDimSize(dim);
   if (!ShapedType::isDynamic(sz))
     return constantIndex(builder, loc, sz);
+
+  // BELL-specific dimension adjustment
+  if (stt.isBELL()) {
+    AffineExpr dimExpr = builder.getAffineSymbolExpr(dim);
+
+    std::optional<unsigned> resultPos = stt.getDimToLvl().getResultPosition(dimExpr);
+
+    const Level lvl = resultPos.has_value() ? static_cast<Level>(resultPos.value()) : Level(0);
+
+    if (stt.isBELLBlockedLvl(lvl)) {
+      Value rawDim = genDimSizeCall(builder, loc, tensor, dim);
+      return builder.create<arith::DivUIOp>(
+          loc, rawDim, 
+          constantIndex(builder, loc, stt.getELLBlockSize()));
+    }
+  }
+
   if (stt.hasEncoding())
     return genDimSizeCall(builder, loc, tensor, dim);
   return linalg::createOrFoldDimOp(builder, loc, tensor, dim);
@@ -210,6 +227,15 @@ public:
     params[kParamValTp] =
         constantPrimaryTypeEncoding(builder, loc, stt.getElementType());
     // Return `this` for method chaining.
+
+    if (stt.isBELL()) {
+      // Extract BELL parameters from sparse tensor type
+      const auto enc = stt.getEncoding();
+      params[kParamELLBlockSize] =
+          constantIndex(builder, loc, enc.getELLBlockSize());
+      params[kParamELLCols] = constantIndex(builder, loc, enc.getELLCols());
+    }
+
     return *this;
   }
 
@@ -225,9 +251,16 @@ public:
   /// and the given dynamic arguments.
   Value genNewCall(Action action, Value ptr = Value()) {
     assert(isInitialized() && "Must initialize before genNewCall");
+
+    // Choose appropriate function name based on format
     StringRef name = "newSparseTensor";
+    if (params[kParamELLBlockSize] && params[kParamELLCols]) {
+      name = "newSparseTensorBell"; // Use BELL-specific function
+    }
+
     params[kParamAction] = constantAction(builder, loc, action);
     params[kParamPtr] = ptr ? ptr : builder.create<LLVM::ZeroOp>(loc, pTp);
+
     return createFuncCall(builder, loc, name, pTp, params, EmitCInterface::On)
         .getResult(0);
   }
@@ -235,7 +268,8 @@ public:
 private:
   static constexpr unsigned kNumStaticParams = 8;
   static constexpr unsigned kNumDynamicParams = 2;
-  static constexpr unsigned kNumParams = kNumStaticParams + kNumDynamicParams;
+  static constexpr unsigned kNumParams =
+      kNumStaticParams + kNumDynamicParams + 2;
   static constexpr unsigned kParamDimSizes = 0;
   static constexpr unsigned kParamLvlSizes = 1;
   static constexpr unsigned kParamLvlTypes = 2;
@@ -246,7 +280,9 @@ private:
   static constexpr unsigned kParamValTp = 7;
   static constexpr unsigned kParamAction = 8;
   static constexpr unsigned kParamPtr = 9;
-
+  // Add BELL-specific parameter indices
+  static constexpr unsigned kParamELLBlockSize = 10;
+  static constexpr unsigned kParamELLCols = 11;
   OpBuilder &builder;
   Location loc;
   Type pTp;

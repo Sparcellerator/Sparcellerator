@@ -209,7 +209,8 @@ enum class LevelPropNonDefault : uint64_t {
   Nonordered = 0x0002, // 0b010
   SoA = 0x0004,        // 0b100
   Blocked = 0x0008,    // 0b1000 - Indicates block-based storage
-  FixedColumns = 0x0010   // 0b10000 - Fixed number of columns per row (ELLPACK style)
+  FixedColumns =
+      0x0010 // 0b10000 - Fixed number of columns per row (ELLPACK style)
 };
 
 /// Returns string representation of the given level properties.
@@ -228,7 +229,6 @@ constexpr const char *toPropString(LevelPropNonDefault lvlProp) {
   }
   return "unknown"; // Handle any unexpected cases
 }
-
 
 /// This enum defines all the sparse representations supportable by
 /// the SparseTensor dialect. We use a lightweight encoding to encode
@@ -268,10 +268,12 @@ public:
 
     return propStr.empty() ? "" : "(" + propStr + ")";
   }
-  // Modified bit layout for BELLPACK:
-  // ----------------------------------------------------
-  // | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
-  // ----------------------------------------------------
+// In LevelType comments:
+/// Bit layout for BELLPACK:
+/// ----------------------------------------------------
+/// | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
+/// ----------------------------------------------------
+
   // For BELLPACK format only, repurpose the upper 32 bits
   /// Check that the `LevelType` contains a valid (possibly undefined) value.
   static constexpr bool isValidLvlBits(uint64_t lvlBits) {
@@ -281,7 +283,7 @@ public:
     if (fmt == LevelFormat::BELLPACK) {
       const uint64_t blockSize = (lvlBits >> 32) & 0xffff;
       const uint64_t ellCols = (lvlBits >> 48) & 0xffff;
-      return blockSize > 0 && ellCols > 0;
+      return blockSize > 0 && ellCols > 0; // Both must be positive
     }
 
     // If undefined/dense/batch/NOutOfM, then must be unique and ordered.
@@ -311,14 +313,15 @@ public:
     return isValidLvlBits(ltBits) ? std::optional(LevelType(ltBits))
                                   : std::nullopt;
   }
+
   static std::optional<LevelType> buildBELLLvlType(uint64_t blockSize,
                                                    uint64_t ellCols) {
-    assert(blockSize <= 0xffff && ellCols <= 0xffff);
+    // Add explicit parameter checks
+    assert(blockSize > 0 && blockSize <= 0xffff && ellCols > 0 &&
+           ellCols <= 0xffff);
     uint64_t ltBits = static_cast<uint64_t>(LevelFormat::BELLPACK);
     ltBits |= (blockSize << 32) | (ellCols << 48);
-
-    return isValidLvlBits(ltBits) ? std::optional(LevelType(ltBits))
-                                  : std::nullopt;
+    return LevelType(ltBits);
   }
 
   static std::optional<LevelType> buildLvlType(LevelFormat lf, bool ordered,
@@ -441,8 +444,12 @@ public:
     std::string lvlStr = toFormatString(getLvlFmt());
     std::string propStr = "";
 
+    // In LevelType::toMLIRString()
     if (isa<LevelFormat::BELLPACK>()) {
-      return std::string("NEED TO FIX toMLIRString for BELLPACK");
+      return "blocked_ell[" + 
+             std::to_string((lvlBits >> 32) & 0xffff) + "," +
+             std::to_string((lvlBits >> 48) & 0xffff) + "]" + 
+             getPropString();
     }
 
     if (isa<LevelFormat::NOutOfM>()) {
@@ -468,12 +475,13 @@ public:
   }
   constexpr bool isBELL() const { return isa<LevelFormat::BELLPACK>(); }
 
-  constexpr bool isBlocked() const { return isa<LevelPropNonDefault::Blocked>(); }
+  constexpr bool isBlocked() const {
+    return isa<LevelPropNonDefault::Blocked>();
+  }
 
   constexpr bool isFixedColumn() const {
     return isa<LevelPropNonDefault::FixedColumns>();
-}
-
+  }
 
 private:
   /// Bit manipulations for LevelType:

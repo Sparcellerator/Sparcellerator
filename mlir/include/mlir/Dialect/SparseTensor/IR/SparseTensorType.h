@@ -144,6 +144,10 @@ public:
            (getBellIdxBase() == 0 || getBellIdxBase() == 1);
   }
   
+  bool isBELLBlockedLvl(Level lvl) const {
+    return getLvlType(lvl) == LevelFormat::BELLPACK;
+  }
+
 
   /// Allow implicit conversion to `RankedTensorType`, `ShapedType`,
   /// and `Type`.  These are implicit to help alleviate the impedance

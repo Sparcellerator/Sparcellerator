@@ -40,8 +40,7 @@ enum class CuSparseFormat {
   kCSR,
   kCSC,
   kBSR,
-  kELLPACK,
-  kBELL, // Add Blocked-ELLPACK format
+  kELLPACK // Add Blocked-ELLPACK format
 };
 
 //===----------------------------------------------------------------------===//
@@ -505,7 +504,7 @@ static CuSparseFormat getCuSparseFormat(SparseTensorType aTp,
     return enableRT ? CuSparseFormat::kCOO : CuSparseFormat::kNone;
 #endif
   if (isAdmissibleBELL(aTp))
-    return CuSparseFormat::kBELL;
+    return CuSparseFormat::kELLPACK;
   if (isAdmissibleELLPACK(aTp))
     return CuSparseFormat::kELLPACK;
   if (isAdmissibleCSR(aTp))
@@ -569,7 +568,7 @@ static Operation *genSpMat(OpBuilder &builder, Location loc,
     return builder.create<gpu::CreateCscOp>(loc, handleTp, tokenTp, token, sz1,
                                             sz2, nseA, rowA, colA, valA);
 
-  if (format == CuSparseFormat::kBELL) {
+  if (format == CuSparseFormat::kELLPACK) {
     // Get blocked ELLPACK parameters
     auto enc = aTp.getEncoding();
     unsigned blockSize = enc.getELLBlockSize();
@@ -847,7 +846,7 @@ static LogicalResult rewriteSpMM(PatternRewriter &rewriter,
   }
 
   // Special handling for BELL format
-  if (format == CuSparseFormat::kBELL) {
+  if (format == CuSparseFormat::kELLPACK) {
     // Create dense tensor handles
     auto dmatB = rewriter.create<gpu::CreateDnTensorOp>(
         loc, dnTensorHandleTp, tokenTp, token, matB,
