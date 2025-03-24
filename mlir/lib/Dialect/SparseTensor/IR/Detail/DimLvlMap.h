@@ -12,6 +12,7 @@
 #include "Var.h"
 
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
+#include "mlir/Dialect/SparseTensor/IR/SparseTensorType.h"
 #include "llvm/ADT/STLForwardCompat.h"
 
 namespace mlir {
@@ -203,16 +204,19 @@ class LvlSpec final {
   LvlExpr expr;
   /// The level-type (== level-format + lvl-properties).
   LevelType type;
+  unsigned ellBlockSize = 0; // BELL block size
+  unsigned ellCols = 0;      // BELL columns per row
 
 public:
-  LvlSpec(LvlVar var, LvlExpr expr, LevelType type);
-
+  LvlSpec(LvlVar var, LvlExpr expr, LevelType type, unsigned eb = 0,
+          unsigned ec = 0); 
   MLIRContext *getContext() const {
     MLIRContext *ctx = expr.tryGetContext();
     assert(ctx);
     return ctx;
   }
-
+  unsigned getEllBlockSize() const { return ellBlockSize; }
+  unsigned getEllCols() const { return ellCols; }
   constexpr LvlVar getBoundVar() const { return var; }
   constexpr bool canElideVar() const { return elideVar; }
   void setElideVar(bool b) { elideVar = b; }

@@ -103,7 +103,7 @@ static void createPushback(OpBuilder &builder, Location loc,
 
 /// Generates code that allocates a sparse storage scheme for given rank.
 static void allocSchemeForRank(OpBuilder &builder, Location loc,
-                              MutSparseTensorDescriptor desc, Level startLvl) {
+                               MutSparseTensorDescriptor desc, Level startLvl) {
   const SparseTensorType stt(desc.getRankedTensorType());
   Value linear = constantIndex(builder, loc, 1);
   const Level lvlRank = stt.getLvlRank();
@@ -121,20 +121,46 @@ static void allocSchemeForRank(OpBuilder &builder, Location loc,
         linear = builder.create<arith::MulIOp>(loc, linear, two);
       }
       createPushback(builder, loc, desc, SparseTensorFieldKind::PosMemRef, lvl,
-                    /*value=*/posZero, /*repeat=*/linear);
+                     /*value=*/posZero, /*repeat=*/linear);
       return;
-    } else if (isEllpackLT(lt)) {
-      // Add ELLPACK-specific handling
-      // Initialize the MaxNnzMemRef field to store max non-zeros per row
-      Value maxNnzZero = constantZero(builder, loc, stt.getPosType());
-      createPushback(builder, loc, desc, SparseTensorFieldKind::MaxNnzMemRef, lvl,
-                    /*value=*/maxNnzZero);
-      // Also need position and coordinate arrays like compressed
-      Value posZero = constantZero(builder, loc, stt.getPosType());
-      createPushback(builder, loc, desc, SparseTensorFieldKind::PosMemRef, lvl,
-                    /*value=*/posZero, /*repeat=*/linear);
+    }
+    else if (isEllpackLT(lt)) {
+      // Get BELL-specific parameters
+      const unsigned blockSize = stt.getELLBlockSize();
+      const unsigned ellCols = stt.getELLCols();
+      
+      // Calculate required storage dimensions
+      Value rows = desc.getLvlSize(builder, loc, lvl);
+      Value blockSizeVal = constantIndex(builder, loc, blockSize);
+      Value numBlocks = builder.create<arith::DivUIOp>(
+          loc, 
+          builder.create<arith::AddIOp>(loc, rows, blockSizeVal),
+          blockSizeVal
+      );
+      Value totalBlocks = builder.create<arith::MulIOp>(
+          loc, numBlocks, constantIndex(builder, loc, ellCols)
+      );
+
+      // Initialize BELL column indices and values arrays
+      Type idxType = stt.getCrdType();
+      Type eltType = stt.getElementType();
+      
+      // Column indices (block indices)
+      Value initCol = builder.create<arith::ConstantIntOp>(loc, -1, idxType);
+      
+      createPushback(builder, loc, desc, SparseTensorFieldKind::CrdMemRef, lvl,
+                    initCol, /*repeat=*/totalBlocks);
+      
+      // Values array (block data)
+      Value blockElems = constantIndex(builder, loc, blockSize * blockSize);
+      Value totalValues = builder.create<arith::MulIOp>(loc, totalBlocks, blockElems);
+      Value zeroVal = constantZero(builder, loc, eltType);
+      createPushback(builder, loc, desc, SparseTensorFieldKind::ValMemRef,
+                    std::nullopt, zeroVal, totalValues);
+      
       return;
-    } else if (isSingletonLT(lt) || isNOutOfMLT(lt)) {
+    } 
+    else if (isSingletonLT(lt) || isNOutOfMLT(lt)) {
       return; // nothing to do
     }
     // Keep compounding the size, but nothing needs to be initialized
@@ -238,10 +264,6 @@ static void createAllocFields(OpBuilder &builder, Location loc,
         case SparseTensorFieldKind::ValMemRef:
           field = createAllocation(builder, loc, cast<MemRefType>(fType),
                                    valHeuristic, enableInit);
-          break;
-        case SparseTensorFieldKind::MaxNnzMemRef:
-          field = createAllocation(builder, loc, cast<MemRefType>(fType),
-                                  posHeuristic, enableInit);
           break;
         }
         assert(field);
@@ -375,166 +397,108 @@ static Value genCompressed(OpBuilder &builder, Location loc,
   return ifOp2.getResult(o);
 }
 
-static Value genELLPACK(OpBuilder &builder, Location loc,
-  MutSparseTensorDescriptor desc, ValueRange lvlCoords,
-  Value value, Value parentPos, Level lvl) {
-    const SparseTensorType stt(desc.getRankedTensorType());
-    const Level lvlRank = stt.getLvlRank();
-    assert(lvl < lvlRank && "Level is out of bounds");
-    assert(lvlCoords.size() == static_cast<size_t>(lvlRank) &&
-    "Level-rank mismatch");
+static Value genBELL(OpBuilder &builder, Location loc,
+                     MutSparseTensorDescriptor desc, ValueRange lvlCoords,
+                     Value value, Value parentPos, Level lvl) {
+  //===----------------------------------------------------------------------===//
+  // 0. Basic setup and validation
+  //===----------------------------------------------------------------------===//
+  const SparseTensorType stt(desc.getRankedTensorType());
+  const Level lvlRank = stt.getLvlRank();
+  assert(lvl < lvlRank && "Level is out of bounds");
+  assert(lvlCoords.size() == static_cast<size_t>(lvlRank) &&
+         "Level-rank mismatch");
 
-    // Get types and constants
-    Type indexType = builder.getIndexType();
-    Type boolType = builder.getIntegerType(1);
-    const Value one = constantIndex(builder, loc, 1);
-    const Value zero = constantIndex(builder, loc, 0);
+  // Get BELL parameters from encoding
+  const unsigned blockSize = stt.getELLBlockSize();
+  const unsigned maxBlocksPerRow = stt.getELLCols();
+  const unsigned BellIdxType = stt.getBellIdxType();
+  const unsigned BellIdxBase = stt.getBellIdxBase();
+  const Type i32Ty = builder.getIntegerType(32);
 
-    // Setup ELLPACK-specific structures
-    Value maxNnzMemRef = desc.getMaxNnzMemRef(lvl);
-    Value maxNnz = genLoad(builder, loc, maxNnzMemRef, zero);
-    Value crdMemRef = desc.getCrdMemRef(lvl);
+  //===----------------------------------------------------------------------===//
+  // 1. Calculate block coordinates
+  //===----------------------------------------------------------------------===//
+  Value lvlCoord = lvlCoords[lvl];
+  Value blockSizeVal = constantIndex(builder, loc, blockSize);
+  Value blockIdx = builder.create<arith::DivUIOp>(loc, lvlCoord, blockSizeVal);
 
-    // Prepare return type for if operations
-    SmallVector<Type> types;
-    types.push_back(indexType);
+  //===----------------------------------------------------------------------===//
+  // 2. Prepare all parameters for external call
+  //===----------------------------------------------------------------------===//
+  // Get memory buffers
+  Value crdMem = desc.getCrdMemRef(lvl); // i32 memref
+  Value valMem = desc.getValMemRef();    // elementType memref
 
-    // Handle first insertion case
-    Value firstInsertion = builder.create<arith::CmpIOp>(
-    loc, arith::CmpIPredicate::eq, maxNnz, zero);
+  // Create constants for new BELL parameters
+  Value bellIdxTypeVal =
+      builder.create<arith::ConstantIntOp>(loc, BellIdxType, i32Ty);
+  Value bellIdxBaseVal =
+      builder.create<arith::ConstantIntOp>(loc, BellIdxBase, i32Ty);
 
-    scf::IfOp ifFirstInsert = builder.create<scf::IfOp>(
-    loc, types, firstInsertion, /*else*/ true);
+  // Other parameters
+  Value maxBlocksVal = constantIndex(builder, loc, maxBlocksPerRow);
+  Value rowIdx = blockIdx;
 
-    // Handle first insertion in a row
-    builder.setInsertionPointToStart(&ifFirstInsert.getThenRegion().front());
-    genStore(builder, loc, one, maxNnzMemRef, zero);
-    genStore(builder, loc, lvlCoords[lvl], crdMemRef, parentPos);
-    builder.create<scf::YieldOp>(loc, parentPos);
+  //===----------------------------------------------------------------------===//
+  // New: Declare the external function first
+  //===----------------------------------------------------------------------===//
+  ModuleOp module =
+      builder.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+  auto funcName = "bell_process_block";
 
-    // Handle subsequent insertions in a row
-    builder.setInsertionPointToStart(&ifFirstInsert.getElseRegion().front());
+  // Create function type if not already present
+  if (!module.lookupSymbol<func::FuncOp>(funcName)) {
+    auto funcType = builder.getFunctionType(
+        /*inputs=*/
+        {
+            desc.getValMemRef().getType(),    // memref<?xf32>
+            desc.getCrdMemRef(lvl).getType(), // memref<?xi32>
+            builder.getIndexType(),           // block_size
+            builder.getIndexType(),           // max_blocks_per_row
+            builder.getIndexType(),           // row_index
+            builder.getI32Type(),             // BellIdxType
+            builder.getI32Type()              // BellIdxBase
+        },
+        /*outputs=*/{} // void
+    );
 
-    // Calculate row offset and search for existing entry
-    Value oldRowOffset = builder.create<arith::MulIOp>(loc, parentPos, maxNnz);
-    Value entryFound = constantI1(builder, loc, false);
-    Value insertPos = oldRowOffset;
-    Value rowNnz = zero;
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(module.getBody());
 
-    // Setup scan loop
-    SmallVector<Value> fieldsArray = {entryFound, insertPos, rowNnz};
-    scf::ForOp scanLoop = createFor(builder, loc, maxNnz, fieldsArray);
+    // Create function using the modern FuncOp creation API
+    auto funcOp = func::FuncOp::create(
+        loc, funcName, funcType,
+        ArrayRef<NamedAttribute>{builder.getNamedAttr(
+            "sym_visibility", builder.getStringAttr("private"))});
 
-    // Scan loop body
-    builder.setInsertionPointToStart(scanLoop.getBody());
-    Value i = scanLoop.getInductionVar();
-    entryFound = scanLoop.getRegionIterArg(0);
-    insertPos = scanLoop.getRegionIterArg(1);
-    rowNnz = scanLoop.getRegionIterArg(2);
+    // Add function to module
+    module.push_back(funcOp);
+  }
 
-    Value pos = builder.create<arith::AddIOp>(loc, oldRowOffset, i);
-    Value crd = genLoad(builder, loc, crdMemRef, pos);
-    Value crdIsZero = builder.create<arith::CmpIOp>(
-    loc, arith::CmpIPredicate::eq, 
-    genCast(builder, loc, crd, indexType), zero);
-    Value crdMatchesInput = builder.create<arith::CmpIOp>(
-    loc, arith::CmpIPredicate::eq, 
-    genCast(builder, loc, crd, indexType), lvlCoords[lvl]);
+  //===----------------------------------------------------------------------===//
+  // 4. Insert external function call with all parameters
+  //===----------------------------------------------------------------------===//
+  builder.create<mlir::func::CallOp>(
+      loc,
+      "bell_process_block", // External function name
+      TypeRange{},          // No results
+      ValueRange{
+          valMem,crdMem,        // Memory buffers
+          blockSizeVal, maxBlocksVal,    // Block parameters
+          rowIdx,                        // Current row index
+          bellIdxTypeVal, bellIdxBaseVal // BELL index config
+      });
 
-    Value newInsertPos = builder.create<arith::SelectOp>(
-    loc, crdIsZero, pos, insertPos);
-    Value newFound = builder.create<arith::OrIOp>(loc, entryFound, crdMatchesInput);
-    Value isNonZero = builder.create<arith::XOrIOp>(loc, crdIsZero, constantI1(builder, loc, true));
-    Value newRowNnz = builder.create<arith::AddIOp>(
-    loc, rowNnz, 
-    builder.create<arith::SelectOp>(
-    loc, isNonZero, one, zero));
-
-    builder.create<scf::YieldOp>(loc, ValueRange{newFound, newInsertPos, newRowNnz});
-
-    // Process scan loop results
-    builder.setInsertionPointAfter(scanLoop);
-    entryFound = scanLoop.getResult(0);
-    insertPos = scanLoop.getResult(1);
-    rowNnz = scanLoop.getResult(2);
-
-    // Handle row expansion if needed - THIS IS WHERE THE BUG WAS
-    Value needExpansion = builder.create<arith::AndIOp>(
-    loc,
-    builder.create<arith::XOrIOp>(loc, entryFound, constantI1(builder, loc, true)),
-    builder.create<arith::CmpIOp>(
-    loc, arith::CmpIPredicate::eq, rowNnz, maxNnz));
-
-    // Create an if that returns the potentially updated insert position
-    SmallVector<Type> expandTypes = {indexType};
-    scf::IfOp ifExpand = builder.create<scf::IfOp>(
-    loc, expandTypes, needExpansion, /*else*/ true);
-
-    // If expansion is needed
-    builder.setInsertionPointToStart(&ifExpand.getThenRegion().front());
-    Value newMaxNnz = builder.create<arith::AddIOp>(loc, maxNnz, one);
-    genStore(builder, loc, newMaxNnz, maxNnzMemRef, zero);
-    Value expandedPos = builder.create<arith::AddIOp>(loc, oldRowOffset, maxNnz);
-    builder.create<scf::YieldOp>(loc, expandedPos);
-
-    // If expansion is not needed
-    builder.setInsertionPointToStart(&ifExpand.getElseRegion().front());
-    builder.create<scf::YieldOp>(loc, insertPos);
-
-    // Get the final insertion position
-    builder.setInsertionPointAfter(ifExpand);
-    Value finalInsertPos = ifExpand.getResult(0);
-
-    // For element not found in row
-    scf::IfOp ifNotFound = builder.create<scf::IfOp>(
-    loc, types,
-    builder.create<arith::XOrIOp>(loc, entryFound, constantI1(builder, loc, true)),
-    /*else*/ true);
-
-    builder.setInsertionPointToStart(&ifNotFound.getThenRegion().front());
-    genStore(builder, loc, lvlCoords[lvl], crdMemRef, finalInsertPos);
-    builder.create<scf::YieldOp>(loc, finalInsertPos);
-
-    // For element found in row
-    builder.setInsertionPointToStart(&ifNotFound.getElseRegion().front());
-
-    // Find matching coordinate position
-    SmallVector<Value> posFieldsArray = {finalInsertPos};
-    scf::ForOp findPosLoop = createFor(builder, loc, maxNnz, posFieldsArray);
-
-    builder.setInsertionPointToStart(findPosLoop.getBody());
-    Value j = findPosLoop.getInductionVar();
-    Value foundPos = findPosLoop.getRegionIterArg(0);
-
-    Value checkPos = builder.create<arith::AddIOp>(loc, oldRowOffset, j);
-    Value checkCrd = genLoad(builder, loc, crdMemRef, checkPos);
-    Value checkMatch = builder.create<arith::CmpIOp>(
-    loc, arith::CmpIPredicate::eq, 
-    genCast(builder, loc, checkCrd, indexType), lvlCoords[lvl]);
-
-    Value newFoundPos = builder.create<arith::SelectOp>(loc, checkMatch, checkPos, foundPos);
-    builder.create<scf::YieldOp>(loc, newFoundPos);
-
-    // Use the result of findPosLoop
-    builder.setInsertionPointToEnd(&ifNotFound.getElseRegion().front());
-    builder.create<scf::YieldOp>(loc, findPosLoop.getResult(0));
-
-    // Use result from ifNotFound
-    builder.setInsertionPointToEnd(&ifFirstInsert.getElseRegion().front());
-    builder.create<scf::YieldOp>(loc, ifNotFound.getResult(0));
-
-    // Get the final result
-    builder.setInsertionPointAfter(ifFirstInsert);
-    Value finalResult = ifFirstInsert.getResult(0);
-
-    // Prepare next level if needed
-    if ((lvl + 1) < lvlRank)
+  //===----------------------------------------------------------------------===//
+  // 5. Update parent position and handle next level
+  //===----------------------------------------------------------------------===//
+  parentPos = blockIdx;
+  if ((lvl + 1) < lvlRank)
     allocSchemeForRank(builder, loc, desc, lvl + 1);
 
-    return finalResult;
+  return parentPos;
 }
-
-
 
 /// Generates insertion finalization code.
 static void genEndInsert(OpBuilder &builder, Location loc,
@@ -576,33 +540,34 @@ static void genEndInsert(OpBuilder &builder, Location loc,
         builder.create<scf::YieldOp>(loc, ifOp.getResult(0));
         builder.setInsertionPointAfter(loop);
       }
-    } 
-    else if (isEllpackLT(lt)) {
-      // For ELLPACK, we need to ensure all rows have consistent storage with maxNnz entries per row
-      Value maxNnzMemRef = desc.getMaxNnzMemRef(lvl);
-      Value maxNnz = genLoad(builder, loc, maxNnzMemRef, constantIndex(builder, loc, 0));
-      
-      // Get level size (number of rows)
+    } else if (isEllpackLT(lt)) {
+      // BELL-specific finalization
+      const unsigned blockSize = stt.getELLBlockSize();
+      const unsigned maxBlocksPerRow = stt.getELLCols();
+
+      // Get level size (number of rows in block terms)
       Value lvlSize = desc.getLvlSize(builder, loc, lvl);
-      
-      // Calculate total size needed for coordinates (lvlSize * maxNnz)
-      Value totalCrdSize = builder.create<arith::MulIOp>(loc, lvlSize, maxNnz);
-      
-      // ELLPACK structure requires updating coordinate memory size to reflect the
-      // full allocated space (rows * maxNnzPerRow)
-      Value crdMemRef = desc.getCrdMemRef(lvl);
-      
-      // Create a mutable descriptor to update memory sizes
-      SmallVector<Value> mutableFields(desc.getFields().begin(), desc.getFields().end());
-      MutSparseTensorDescriptor mutDesc(desc.getRankedTensorType(), mutableFields);
-      mutDesc.setCrdMemSize(builder, loc, lvl, totalCrdSize);
-      
-      // If this is the last level (just before values), also ensure value array size is consistent
+
+      // Calculate total required storage
+      Value totalBlocks = builder.create<arith::MulIOp>(
+          loc, lvlSize,
+          builder.create<arith::ConstantIndexOp>(loc, maxBlocksPerRow));
+
+      // Update coordinates memory size (blocks per row * rows)
+      SmallVector<Value> mutableFields(desc.getFields().begin(),
+                                       desc.getFields().end());
+      MutSparseTensorDescriptor mutDesc(stt, mutableFields);
+      mutDesc.setCrdMemSize(builder, loc, lvl, totalBlocks);
+
+      // Update values memory size (blocks * elements_per_block)
       if (lvl == lvlRank - 1) {
-        mutDesc.setValMemSize(builder, loc, totalCrdSize);
+        Value elemsPerBlock =
+            builder.create<arith::ConstantIndexOp>(loc, blockSize * blockSize);
+        Value totalValues =
+            builder.create<arith::MulIOp>(loc, totalBlocks, elemsPerBlock);
+        mutDesc.setValMemSize(builder, loc, totalValues);
       }
-    }    
-    else {
+    } else {
       assert(isDenseLT(lt) || isLooseCompressedLT(lt) || isSingletonLT(lt) ||
              isNOutOfMLT(lt));
     }
@@ -696,12 +661,10 @@ public:
         }
         parentPos =
             genCompressed(builder, loc, desc, coords, value, parentPos, lvl);
-      } 
-      else if (isEllpackLT(lt)) {
+      } else if (isEllpackLT(lt)) {
         // Add ELLPACK-specific handling
-        parentPos = genELLPACK(builder, loc, desc, coords, value, parentPos, lvl);
-      }
-      else if (isSingletonLT(lt) || isNOutOfMLT(lt)) {
+        parentPos = genBELL(builder, loc, desc, coords, value, parentPos, lvl);
+      } else if (isSingletonLT(lt) || isNOutOfMLT(lt)) {
         // Create:
         //   coordinates[lvl].push_back(coords[lvl])
         //   positions[lvl] = positions[lvl-1]
@@ -1354,20 +1317,20 @@ public:
 class SparseConvertConverter : public OpConversionPattern<ConvertOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
-  
-  LogicalResult handleDenseToEllpackConversion(
-    ConvertOp op, OpAdaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
+
+  LogicalResult
+  handleDenseToEllpackConversion(ConvertOp op, OpAdaptor adaptor,
+                                 ConversionPatternRewriter &rewriter) const {
     Location loc = op.getLoc();
-    
+
     // Fix #1: Use proper SparseTensorType construction
     auto dstType = SparseTensorType(op.getType().cast<RankedTensorType>());
-    
+
     // Extract dimension sizes from source tensor
     Value srcTensor = adaptor.getSource();
     auto srcType = op.getSource().getType().cast<RankedTensorType>();
     SmallVector<Value> lvlSizesValues;
-    
+
     for (int d = 0, dimRank = srcType.getRank(); d < dimRank; ++d) {
       if (srcType.isDynamicDim(d)) {
         Value dimSize = rewriter.create<tensor::DimOp>(loc, srcTensor, d);
@@ -1377,15 +1340,16 @@ public:
         lvlSizesValues.push_back(dimSize);
       }
     }
-    
+
     // Allocate the ELLPACK tensor
     SmallVector<Value> fields;
-    // Fix #3: Pass correct arguments - createAllocFields expects a SmallVector<Value>, not ArrayRef<ValueRange>
+    // Fix #3: Pass correct arguments - createAllocFields expects a
+    // SmallVector<Value>, not ArrayRef<ValueRange>
     createAllocFields(rewriter, loc, dstType, /*enableInit=*/true,
-                    /*sizeHint=*/Value(), lvlSizesValues, fields);
-    
+                      /*sizeHint=*/Value(), lvlSizesValues, fields);
+
     MutSparseTensorDescriptor desc(dstType, fields);
-    
+
     // Initialize the maxNnz field for ELLPACK (set to 0 initially)
     for (Level lvl = 0; lvl < dstType.getLvlRank(); lvl++) {
       if (isEllpackLT(dstType.getLvlType(lvl))) {
@@ -1394,15 +1358,15 @@ public:
         genStore(rewriter, loc, zero, maxNnzMemRef, zero);
       }
     }
-    
+
     // Scan the dense tensor and insert non-zero values into ELLPACK format
     SmallVector<Value> indices;
     indices.resize(srcType.getRank(), constantIndex(rewriter, loc, 0));
-    
+
     // Create nested loops to iterate through the dense tensor
-    buildNestedLoopsForDenseToSparse(
-        rewriter, loc, dstType, srcTensor, desc, indices, 0);
-    
+    buildNestedLoopsForDenseToSparse(rewriter, loc, dstType, srcTensor, desc,
+                                     indices, 0);
+
     // Fix #2: Pass the correct Value collection to replaceOpWithMultiple
     // Create a vector of ValueRange objects
     SmallVector<ValueRange> replacementValues;
@@ -1413,21 +1377,19 @@ public:
     return success();
   }
 
-
-
-
-  void buildNestedLoopsForDenseToSparse(
-    ConversionPatternRewriter &rewriter, Location loc,
-    SparseTensorType dstType, Value srcTensor,
-    MutSparseTensorDescriptor &desc, SmallVector<Value> &indices, 
-    unsigned dim) const {
+  void buildNestedLoopsForDenseToSparse(ConversionPatternRewriter &rewriter,
+                                        Location loc, SparseTensorType dstType,
+                                        Value srcTensor,
+                                        MutSparseTensorDescriptor &desc,
+                                        SmallVector<Value> &indices,
+                                        unsigned dim) const {
     unsigned rank = dstType.getDimRank();
     if (dim == rank) {
       // At the innermost level, read value and insert if non-zero
       Value val = rewriter.create<tensor::ExtractOp>(loc, srcTensor, indices);
       Value zero = constantZero(rewriter, loc, dstType.getElementType());
       Value isNonZero;
-      
+
       if (dstType.getElementType().isIntOrIndex()) {
         isNonZero = rewriter.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::ne, val, zero); // Fixed: NE → ne
@@ -1435,19 +1397,19 @@ public:
         isNonZero = rewriter.create<arith::CmpFOp>(
             loc, arith::CmpFPredicate::UNE, val, zero);
       }
-      
+
       scf::IfOp ifNonZero = rewriter.create<scf::IfOp>(
           loc, TypeRange(), isNonZero, /*else=*/false);
-      
+
       rewriter.setInsertionPointToStart(&ifNonZero.getThenRegion().front());
-      
+
       // Insert the non-zero element into the sparse tensor
       genInsert(rewriter, loc, desc, indices, val);
-      
+
       rewriter.setInsertionPointAfter(ifNonZero);
       return;
     }
-    
+
     // Create loop for current dimension
     Value zero = constantIndex(rewriter, loc, 0);
     Value one = constantIndex(rewriter, loc, 1);
@@ -1455,30 +1417,29 @@ public:
     if (dstType.isDynamicDim(dim)) {
       dimSize = rewriter.create<tensor::DimOp>(loc, srcTensor, dim);
     } else {
-      // Fixed: Use the correct method to get dimension size from SparseTensorType
+      // Fixed: Use the correct method to get dimension size from
+      // SparseTensorType
       RankedTensorType rtt = dstType.getRankedTensorType();
       dimSize = constantIndex(rewriter, loc, rtt.getDimSize(dim));
     }
-    
-    scf::ForOp forOp = rewriter.create<scf::ForOp>(
-        loc, zero, dimSize, one);
-    
+
+    scf::ForOp forOp = rewriter.create<scf::ForOp>(loc, zero, dimSize, one);
+
     rewriter.setInsertionPointToStart(forOp.getBody());
-    
+
     // Update index for current dimension
     indices[dim] = forOp.getInductionVar();
-    
+
     // Recurse to handle next dimension
-    buildNestedLoopsForDenseToSparse(
-        rewriter, loc, dstType, srcTensor, desc, indices, dim + 1);
-    
+    buildNestedLoopsForDenseToSparse(rewriter, loc, dstType, srcTensor, desc,
+                                     indices, dim + 1);
+
     rewriter.setInsertionPointAfter(forOp);
   }
 
-
   void genInsert(ConversionPatternRewriter &rewriter, Location loc,
-    MutSparseTensorDescriptor &desc, 
-    ValueRange indices, Value value) const {
+                 MutSparseTensorDescriptor &desc, ValueRange indices,
+                 Value value) const {
     // Use sparse_tensor.insert to insert the value at the given indices
     SmallVector<Value> operands;
     operands.push_back(value);
@@ -1488,23 +1449,22 @@ public:
     // Get the field types for return types
     SmallVector<Type> fieldTypes;
     for (auto field : desc.getFields())
-    fieldTypes.push_back(field.getType());
+      fieldTypes.push_back(field.getType());
 
     // Create the SparseInsertGenerator with the correct constructor signature
     SparseInsertGenerator insertGen(
-    desc.getRankedTensorType(),   // TensorType rtp
-    fieldTypes,                   // TypeRange retTypes
-    operands,                     // ValueRange params
-    false);                       // bool genCall - false to inline the code
+        desc.getRankedTensorType(), // TensorType rtp
+        fieldTypes,                 // TypeRange retTypes
+        operands,                   // ValueRange params
+        false);                     // bool genCall - false to inline the code
 
     // Now use genCallOrInline to generate the insertion code
     auto results = insertGen.genCallOrInline(rewriter, loc);
 
     // Update the descriptor fields with the results
     for (unsigned i = 0; i < results.size(); i++)
-    desc.getFields()[i] = results[i];
+      desc.getFields()[i] = results[i];
   }
-
 
   LogicalResult
   matchAndRewrite(ConvertOp op, OneToNOpAdaptor adaptor,
@@ -1512,11 +1472,11 @@ public:
     SparseTensorEncodingAttr encDst = getSparseTensorEncoding(op.getType());
     SparseTensorEncodingAttr encSrc =
         getSparseTensorEncoding(op.getSource().getType());
-    
+
     // The output tensor can not be a slice and those cases should have been
     // rejected by ConvertOp::verify() already.
     assert(!encDst.isSlice() && "Cannot convert to a sparse tensor slices.");
-    
+
     // Special case: Handle dense-to-ELLPACK conversion specifically
     if (!encSrc && encDst) {
       // Check if the destination encoding uses ELLPACK format
@@ -1527,35 +1487,35 @@ public:
           break;
         }
       }
-      
+
       if (hasEllpack) {
         ConvertOpAdaptor singleAdaptor(op);
         return handleDenseToEllpackConversion(op, singleAdaptor, rewriter);
       }
     }
-    
+
     // Rest of the function remains unchanged
-    if ((encDst && encSrc && 
+    if ((encDst && encSrc &&
          encDst.withoutBitWidths() != encSrc.withoutBitWidths()) ||
         (encSrc && encSrc.isSlice())) {
       return failure();
     }
-    
+
     Type retElemTp = op.getResult().getType().getElementType();
     Type srcElemTp = op.getSource().getType().getElementType();
-    
+
     // Fold the trivial cases.
     if (retElemTp == srcElemTp && encDst == encSrc) {
       rewriter.replaceOpWithMultiple(op, {adaptor.getSource()});
       return success();
     }
-    
+
     //
     // Do element-wise type conversion without using InsertOp.
     //
     Location loc = op.getLoc();
     auto srcDesc = getDescriptorFromTensorTuple(adaptor.getSource(),
-                                               op.getSource().getType());
+                                                op.getSource().getType());
     SmallVector<Value> fields;
     foreachFieldAndTypeInSparseTensor(
         SparseTensorType(cast<RankedTensorType>(op.getResult().getType())),
@@ -1565,15 +1525,6 @@ public:
           // Simply reuses the storage specifier as it is an SSA value.
           if (fKind == SparseTensorFieldKind::StorageSpec) {
             fields.push_back(srcDesc.getSpecifier());
-          } else if (fKind == SparseTensorFieldKind::MaxNnzMemRef) {
-            // For ELLPACK format, initialize the max non-zeros per row
-            auto dstMem = rewriter.create<memref::AllocOp>(
-                loc, cast<MemRefType>(fTp), constantIndex(rewriter, loc, 1));
-            // Initialize with zero
-            rewriter.create<memref::StoreOp>(
-                loc, constantIndex(rewriter, loc, 0), dstMem, 
-                ValueRange{constantIndex(rewriter, loc, 0)});
-            fields.push_back(dstMem);
           } else {
             // Allocates new memrefs
             Value srcMem = srcDesc.getMemRefField(fIdx);
@@ -1605,10 +1556,10 @@ public:
           }
           return true;
         });
-    
+
     rewriter.replaceOpWithMultiple(op, {fields});
     return success();
-  }  
+  }
 };
 
 class SparseExtractSliceConverter
@@ -1755,6 +1706,7 @@ struct SparseAssembleOpConverter : public OpConversionPattern<AssembleOp> {
         posBack = rewriter.create<arith::SubIOp>(loc, memSize, c1);
         continue;
       }
+      
       if (lt.isa<LevelFormat::Batch>()) {
         // Skips batch levels as it is not linearized.
         // FIXME: this assumes that every batch has the same number of nse, need

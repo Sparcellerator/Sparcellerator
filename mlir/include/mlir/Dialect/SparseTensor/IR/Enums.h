@@ -268,11 +268,11 @@ public:
 
     return propStr.empty() ? "" : "(" + propStr + ")";
   }
-// In LevelType comments:
-/// Bit layout for BELLPACK:
-/// ----------------------------------------------------
-/// | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
-/// ----------------------------------------------------
+  // In LevelType comments:
+  /// Bit layout for BELLPACK:
+  /// ----------------------------------------------------
+  /// | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
+  /// ----------------------------------------------------
 
   // For BELLPACK format only, repurpose the upper 32 bits
   /// Check that the `LevelType` contains a valid (possibly undefined) value.
@@ -314,15 +314,26 @@ public:
                                   : std::nullopt;
   }
 
+  //===----------------------------------------------------------------------===//
+  // BELL Parameter Encoding
+  //===----------------------------------------------------------------------===//
+
   static std::optional<LevelType> buildBELLLvlType(uint64_t blockSize,
                                                    uint64_t ellCols) {
-    // Add explicit parameter checks
-    assert(blockSize > 0 && blockSize <= 0xffff && ellCols > 0 &&
-           ellCols <= 0xffff);
-    uint64_t ltBits = static_cast<uint64_t>(LevelFormat::BELLPACK);
-    ltBits |= (blockSize << 32) | (ellCols << 48);
+    // Parameter validation
+    if (blockSize == 0 || blockSize > 0xFFFF || ellCols == 0 ||
+        ellCols > 0xFFFF)
+      return std::nullopt;
+
+    // Bit layout:
+    // ----------------------------------------------------
+    // | 16-bit ellCols | 16-bit blockSize | 16-bit Format | 16-bit Properties |
+    // ----------------------------------------------------
+    const uint64_t ltBits = static_cast<uint64_t>(LevelFormat::BELLPACK) |
+                            (blockSize << 32) | (ellCols << 48);
     return LevelType(ltBits);
   }
+
 
   static std::optional<LevelType> buildLvlType(LevelFormat lf, bool ordered,
                                                bool unique, uint64_t n = 0,
@@ -439,17 +450,27 @@ public:
   constexpr unsigned getNumBuffer() const {
     return hasDenseSemantic() ? 0 : (isWithPosLT() ? 2 : 1);
   }
+  
+  static std::pair<unsigned, unsigned> getBELLParameters(LevelType lt) {
+    if (!lt.isa<LevelFormat::BELLPACK>())
+      return {0, 0};
+  
+    const uint64_t bits = static_cast<uint64_t>(lt);
+    return {
+        static_cast<unsigned>((bits >> 32) & 0xFFFF), // blockSize
+        static_cast<unsigned>((bits >> 48) & 0xFFFF)  // ellCols
+    };
+  }
 
   std::string toMLIRString() const {
     std::string lvlStr = toFormatString(getLvlFmt());
     std::string propStr = "";
 
     // In LevelType::toMLIRString()
-    if (isa<LevelFormat::BELLPACK>()) {
-      return "blocked_ell[" + 
-             std::to_string((lvlBits >> 32) & 0xffff) + "," +
-             std::to_string((lvlBits >> 48) & 0xffff) + "]" + 
-             getPropString();
+    if (isBELL()) {
+      auto [blockSize, ellCols] = getBELLParameters(*this);
+      return "blocked_ell[" + std::to_string(blockSize) + "," + 
+             std::to_string(ellCols) + "]" + getPropString();
     }
 
     if (isa<LevelFormat::NOutOfM>()) {

@@ -62,8 +62,9 @@ bool DimSpec::isValid(Ranks const &ranks) const {
 // `LvlSpec` implementation.
 //===----------------------------------------------------------------------===//
 
-LvlSpec::LvlSpec(LvlVar var, LvlExpr expr, LevelType type)
-    : var(var), expr(expr), type(type) {
+LvlSpec::LvlSpec(LvlVar var, LvlExpr expr, LevelType type, unsigned eb,
+                 unsigned ec)
+    : var(var), expr(expr), type(type), ellBlockSize(eb), ellCols(ec) {
   assert(expr);
   assert(isValidLT(type) && !isUndefLT(type));
 }
@@ -118,27 +119,60 @@ bool DimLvlMap::isWF() const {
 AffineMap DimLvlMap::getDimToLvlMap(MLIRContext *context) const {
   SmallVector<AffineExpr> lvlAffines;
   lvlAffines.reserve(getLvlRank());
-  for (const auto &lvlSpec : lvlSpecs)
-    lvlAffines.push_back(lvlSpec.getExpr().getAffineExpr());
-  auto map = AffineMap::get(getDimRank(), getSymRank(), lvlAffines, context);
-  return map;
+  
+  for (const auto &lvlSpec : lvlSpecs) {
+    AffineExpr expr = lvlSpec.getExpr().getAffineExpr();
+    
+    // Handle BELL block decomposition
+    if (lvlSpec.getEllBlockSize() > 0) {
+      const unsigned blockSize = lvlSpec.getEllBlockSize();
+      lvlAffines.pop_back();
+      // First level: block index (floorDiv)
+      lvlAffines.push_back(expr.floorDiv(blockSize));
+      
+      // Second level: intra-block offset (mod)
+      lvlAffines.push_back(expr % blockSize);
+    } else {
+      // Regular level mapping
+      lvlAffines.push_back(expr);
+    }
+  }
+  
+  return AffineMap::get(getDimRank(), getSymRank(), lvlAffines, context);
 }
+
 
 AffineMap DimLvlMap::getLvlToDimMap(MLIRContext *context) const {
   SmallVector<AffineExpr> dimAffines;
   dimAffines.reserve(getDimRank());
-  for (const auto &dimSpec : dimSpecs) {
-    auto expr = dimSpec.getExpr().getAffineExpr();
-    if (expr) {
-      dimAffines.push_back(expr);
+
+  const Level lvlRank = getLvlRank();
+  Level l = 0;
+  Level dim = 0;
+
+  while (l < lvlRank) {
+    const auto &lvlSpec = lvlSpecs[l];
+    if (lvlSpec.getEllBlockSize() > 0) {
+      // Handle BELL blocked dimension
+      const unsigned blockSize = lvlSpec.getEllBlockSize();
+      const unsigned ellCols = lvlSpec.getEllCols();
+
+      // Consume two levels per BELL block
+      AffineExpr blockIdx = getAffineDimExpr(l -1 , context);     // Block index level
+      AffineExpr offset = getAffineDimExpr(l , context);   // Offset level
+      dimAffines.push_back(blockIdx * blockSize + offset);
+      l += 1; 
+      dim++;
+    } else {
+      // Regular level mapping
+      dimAffines.push_back(getAffineDimExpr(l, context));
+      l++;
+      dim++;
     }
   }
-  auto map = AffineMap::get(getLvlRank(), getSymRank(), dimAffines, context);
-  // If no lvlToDim map was passed in, returns a null AffineMap and infers it
-  // in SparseTensorEncodingAttr::parse.
-  if (dimAffines.empty())
-    return AffineMap();
-  return map;
+
+  return AffineMap::get(/*dimCount=*/getLvlRank(),
+                        /*symbolCount=*/getSymRank(), dimAffines, context);
 }
 
 //===----------------------------------------------------------------------===//

@@ -107,21 +107,32 @@ void StorageLayout::foreachField(
   const Level lvlRank = enc.getLvlRank();
   SmallVector<COOSegment> cooSegs = enc.getCOOSegments();
   FieldIndex fieldIdx = kDataFieldStartingIdx;
+  bool hasBELL = false;
 
   ArrayRef cooSegsRef = cooSegs;
   // Per-level storage.
   for (Level l = 0; l < lvlRank; /*l += 1 or l += AoSCooLen*/) {
     const auto lt = lvlTypes[l];
+
+    // Handle BELL levels first
+    if (isEllpackLT(lt)) {
+      hasBELL = true;
+      // BELL uses CrdMemRef for block indices and ValMemRef for block values
+      if (!callback(fieldIdx++, SparseTensorFieldKind::CrdMemRef, l, lt))
+        return;
+      if (!callback(fieldIdx++, SparseTensorFieldKind::ValMemRef, l, lt))
+        return;
+      l++; // Process next level
+      continue;
+    }
+
+    // Original logic for other formats
     if (isWithPosLT(lt)) {
       if (!(callback(fieldIdx++, SparseTensorFieldKind::PosMemRef, l, lt)))
         return;
     }
     if (isWithCrdLT(lt)) {
       if (!(callback(fieldIdx++, SparseTensorFieldKind::CrdMemRef, l, lt)))
-        return;
-    }
-    if (isEllpackLT(lt)) {
-      if (!(callback(fieldIdx++, SparseTensorFieldKind::MaxNnzMemRef, l, lt)))
         return;
     }
     if (!cooSegsRef.empty() && cooSegsRef.front().isSegmentStart(l)) {
@@ -140,11 +151,15 @@ void StorageLayout::foreachField(
       l++;
     }
   }
-  // The values array.
-  if (!(callback(fieldIdx++, SparseTensorFieldKind::ValMemRef, kInvalidLevel,
-                 LevelFormat::Undef)))
-    return;
-  // Put metadata at the end.
+
+  // Add global values array only if no BELL levels
+  if (!hasBELL) {
+    if (!(callback(fieldIdx++, SparseTensorFieldKind::ValMemRef, kInvalidLevel,
+                   LevelFormat::Undef)))
+      return;
+  }
+
+  // Metadata
   if (!(callback(fieldIdx++, SparseTensorFieldKind::StorageSpec, kInvalidLevel,
                  LevelFormat::Undef)))
     return;
@@ -170,9 +185,9 @@ void sparse_tensor::foreachFieldAndTypeInSparseTensor(
   // memref<[batch] x ? x pos> max non-zeros per row (for ELLPACK)
   const Type maxNnzMemType = MemRefType::get(memrefShape, stt.getPosType());
 
-StorageLayout(stt).foreachField([specType, posMemType, crdMemType, valMemType, maxNnzMemType,
-                                 callback](FieldIndex fieldIdx,
-                                           SparseTensorFieldKind fieldKind,
+  StorageLayout(stt).foreachField(
+      [specType, posMemType, crdMemType, valMemType, maxNnzMemType,
+       callback](FieldIndex fieldIdx, SparseTensorFieldKind fieldKind,
                  Level lvl, LevelType lt) -> bool {
         switch (fieldKind) {
         case SparseTensorFieldKind::StorageSpec:
@@ -183,8 +198,6 @@ StorageLayout(stt).foreachField([specType, posMemType, crdMemType, valMemType, m
           return callback(crdMemType, fieldIdx, fieldKind, lvl, lt);
         case SparseTensorFieldKind::ValMemRef:
           return callback(valMemType, fieldIdx, fieldKind, lvl, lt);
-        case SparseTensorFieldKind::MaxNnzMemRef:
-          return callback(maxNnzMemType, fieldIdx, fieldKind, lvl, lt);
         };
         llvm_unreachable("unrecognized field kind");
       });
@@ -391,7 +404,8 @@ SparseTensorEncodingAttr SparseTensorEncodingAttr::withDimSlices(
     ArrayRef<SparseTensorDimSliceAttr> dimSlices) const {
   return SparseTensorEncodingAttr::get(
       getContext(), getLvlTypes(), getDimToLvl(), getLvlToDim(), getPosWidth(),
-      getCrdWidth(), getExplicitVal(), getImplicitVal(), dimSlices, getELLBlockSize(), getELLCols(), getBellIdxType(), getBellIdxBase());
+      getCrdWidth(), getExplicitVal(), getImplicitVal(), dimSlices,
+      getELLBlockSize(), getELLCols(), getBellIdxType(), getBellIdxBase());
 }
 
 SparseTensorEncodingAttr SparseTensorEncodingAttr::withoutDimSlices() const {
@@ -527,34 +541,56 @@ SparseTensorEncodingAttr::translateShape(ArrayRef<int64_t> srcShape,
   dimRep.reserve(srcShape.size());
   for (int64_t sz : srcShape) {
     if (!ShapedType::isDynamic(sz)) {
-      // Push back the max coordinate for the given dimension/level size.
+      // Convert size to max coordinate (sz - 1)
       dimRep.push_back(getAffineConstantExpr(sz - 1, getContext()));
     } else {
-      // A dynamic size, use a AffineDimExpr to symbolize the value.
       dimRep.push_back(getAffineDimExpr(dimRep.size(), getContext()));
     }
   };
 
-  for (AffineExpr exp : transMap.getResults()) {
-    // Do constant propagation on the affine map.
+  const auto lvlTypes = getLvlTypes();
+  for (unsigned i = 0; i < transMap.getNumResults(); ++i) {
+    AffineExpr exp = transMap.getResult(i);
     AffineExpr evalExp =
         simplifyAffineExpr(exp.replaceDims(dimRep), srcShape.size(), 0);
-    // use llvm namespace here to avoid ambiguity
-    if (auto c = llvm::dyn_cast<AffineConstantExpr>(evalExp)) {
-      ret.push_back(c.getValue() + 1);
-    } else {
-      if (auto mod = llvm::dyn_cast<AffineBinaryOpExpr>(evalExp);
-          mod && mod.getKind() == AffineExprKind::Mod) {
-        // We can still infer a static bound for expressions in form
-        // "d % constant" since d % constant \in [0, constant).
-        if (auto bound = llvm::dyn_cast<AffineConstantExpr>(mod.getRHS())) {
-          ret.push_back(bound.getValue());
+
+    // BELL-specific handling
+    if (dir == CrdTransDirectionKind::dim2lvl) {
+      const Level lvl = i;
+      const LevelType lt = lvlTypes[lvl];
+      if (isEllpackLT(lt)) {
+        const unsigned blockSize = getELLBlockSize();
+        const unsigned ellCols = getELLCols();
+
+        if (auto c = llvm::dyn_cast<AffineConstantExpr>(evalExp)) {
+          // Static size: ceil(dimSize / blockSize) * ellCols
+          const int64_t dimSize = c.getValue() + 1; // Convert back to size
+          const int64_t numBlocks = (dimSize + blockSize - 1) / blockSize;
+          ret.push_back(numBlocks * ellCols);
+          continue;
+        } else {
+          // Dynamic size or complex expression
+          ret.push_back(ShapedType::kDynamic);
           continue;
         }
       }
+    }
+
+    // Original logic for non-BELL levels
+    if (auto c = llvm::dyn_cast<AffineConstantExpr>(evalExp)) {
+      ret.push_back(c.getValue() + 1);
+    } else if (auto mod = llvm::dyn_cast<AffineBinaryOpExpr>(evalExp);
+               mod && mod.getKind() == AffineExprKind::Mod) {
+      if (auto bound = llvm::dyn_cast<AffineConstantExpr>(mod.getRHS())) {
+        ret.push_back(bound.getValue());
+      } else {
+        ret.push_back(ShapedType::kDynamic);
+      }
+    } else {
       ret.push_back(ShapedType::kDynamic);
     }
   }
+
   assert(ret.size() == rank);
   return ret;
 }
@@ -571,6 +607,16 @@ SparseTensorEncodingAttr::translateCrds(OpBuilder &builder, Location loc,
       builder.getIndexType());
   auto transOp = builder.create<CrdTranslateOp>(loc, retType, crds, dir, *this);
   return transOp.getOutCrds();
+}
+static std::pair<unsigned, unsigned> getBELLParameters(LevelType lt) {
+  if (!lt.isa<LevelFormat::BELLPACK>())
+    return {0, 0};
+
+  const uint64_t bits = static_cast<uint64_t>(lt);
+  return {
+      static_cast<unsigned>((bits >> 32) & 0xFFFF), // blockSize
+      static_cast<unsigned>((bits >> 48) & 0xFFFF)  // ellCols
+  };
 }
 
 Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
@@ -589,9 +635,16 @@ Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
   unsigned crdWidth = 0;
   Attribute explicitVal;
   Attribute implicitVal;
+  unsigned bellIdxType = 0;
+  unsigned bellIdxBase = 0;
+
+  unsigned ELLBlockSize = 0;
+  unsigned ELLCols = 0;
+
   StringRef attrName;
-  SmallVector<StringRef, 5> keys = {"map", "posWidth", "crdWidth",
-                                    "explicitVal", "implicitVal"};
+  SmallVector<StringRef> keys = {"map",         "posWidth",    "crdWidth",
+                                 "explicitVal", "implicitVal", "bellIdxType",
+                                 "bellIdxBase"};
   while (succeeded(parser.parseOptionalKeyword(&attrName))) {
     // Detect admissible keyword.
     auto *it = find(keys, attrName);
@@ -615,6 +668,21 @@ Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
       const Level lvlRank = dlm.getLvlRank();
       for (Level lvl = 0; lvl < lvlRank; lvl++)
         lvlTypes.push_back(dlm.getLvlType(lvl));
+
+      // Process the level types to extract BELL parameters
+      for (auto lt : lvlTypes) {
+        if (isEllpackLT(lt)) {
+          auto [bs, ec] = getBELLParameters(lt);
+          if (ELLBlockSize != 0 && (ELLBlockSize != bs || ELLCols != ec)) {
+            parser.emitError(
+                parser.getNameLoc(),
+                "Multiple BELL levels with different parameters not supported");
+            return {};
+          }
+          ELLBlockSize = bs;
+          ELLCols = ec;
+        }
+      }
 
       const Dimension dimRank = dlm.getDimRank();
       for (Dimension dim = 0; dim < dimRank; dim++)
@@ -699,6 +767,32 @@ Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
       }
       break;
     }
+    case 5: { // bellIdxType
+      Attribute attr;
+      if (failed(parser.parseAttribute(attr)))
+        return {};
+      auto intAttr = llvm::dyn_cast<IntegerAttr>(attr);
+      if (!intAttr) {
+        parser.emitError(parser.getNameLoc(),
+                         "expected integer for bellIdxType");
+        return {};
+      }
+      bellIdxType = intAttr.getInt();
+      break;
+    }
+    case 6: { // bellIdxBase
+      Attribute attr;
+      if (failed(parser.parseAttribute(attr)))
+        return {};
+      auto intAttr = llvm::dyn_cast<IntegerAttr>(attr);
+      if (!intAttr) {
+        parser.emitError(parser.getNameLoc(),
+                         "expected integer for bellIdxBase");
+        return {};
+      }
+      bellIdxBase = intAttr.getInt();
+      break;
+    }
     } // switch
     // Only last item can omit the comma.
     if (parser.parseOptionalComma().failed())
@@ -715,9 +809,11 @@ Attribute SparseTensorEncodingAttr::parse(AsmParser &parser, Type type) {
   if (!lvlToDim || lvlToDim.isEmpty()) {
     lvlToDim = inferLvlToDim(dimToLvl, parser.getContext());
   }
+
   return parser.getChecked<SparseTensorEncodingAttr>(
       parser.getContext(), lvlTypes, dimToLvl, lvlToDim, posWidth, crdWidth,
-      explicitVal, implicitVal, dimSlices, 0, 0, 0, 0);
+      explicitVal, implicitVal, dimSlices, ELLBlockSize, ELLCols, bellIdxType,
+      bellIdxBase); // Pass extracted values
 }
 
 void SparseTensorEncodingAttr::print(AsmPrinter &printer) const {
@@ -792,11 +888,33 @@ LogicalResult SparseTensorEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, ArrayRef<LevelType> lvlTypes,
     AffineMap dimToLvl, AffineMap lvlToDim, unsigned posWidth,
     unsigned crdWidth, Attribute explicitVal, Attribute implicitVal,
-    ArrayRef<SparseTensorDimSliceAttr> dimSlices, unsigned blockSize, unsigned ellCols, unsigned idxType, unsigned idxBase) {
+    ArrayRef<SparseTensorDimSliceAttr> dimSlices, unsigned blockSize,
+    unsigned ellCols, unsigned idxType, unsigned idxBase) {
   if (!acceptBitWidth(posWidth))
     return emitError() << "unexpected position bitwidth: " << posWidth;
   if (!acceptBitWidth(crdWidth))
     return emitError() << "unexpected coordinate bitwidth: " << crdWidth;
+
+  // BELL-specific validation
+  const bool hasBELL =
+      llvm::any_of(lvlTypes, [](LevelType lt) { return isEllpackLT(lt); });
+
+  if (hasBELL) {
+    // Verify required BELL parameters
+    if (blockSize == 0 || ellCols == 0)
+      return emitError() << "BELL format requires blockSize>0 and ellCols>0";
+
+    if (idxType > 1)
+      return emitError() << "BellIdxType must be 0 (32-bit) or 1 (64-bit)";
+
+    if (idxBase > 1)
+      return emitError()
+             << "BellIdxBase must be 0 (zero-based) or 1 (one-based)";
+  } else {
+    // Reject BELL params if no BELL levels
+    if (blockSize != 0 || ellCols != 0 || idxType != 0 || idxBase != 0)
+      return emitError() << "BELL parameters set for non-BELL level(s)";
+  }
 
   // Verify every COO segment.
   auto *it = std::find_if(lvlTypes.begin(), lvlTypes.end(), isSingletonLT);
@@ -1068,54 +1186,48 @@ AffineMap mlir::sparse_tensor::inferLvlToDim(AffineMap dimToLvl,
 AffineMap mlir::sparse_tensor::inverseBlockSparsity(AffineMap dimToLvl,
                                                     MLIRContext *context) {
   SmallVector<AffineExpr> lvlExprs;
-  auto numLvls = dimToLvl.getNumResults();
-  lvlExprs.reserve(numLvls);
-  // lvlExprComponents stores information of the floordiv and mod operations
-  // applied to the same dimension, so as to build the lvlToDim map.
-  std::map<unsigned, SmallVector<AffineExpr, 3>> lvlExprComponents;
-  for (unsigned i = 0, n = numLvls; i < n; i++) {
-    auto result = dimToLvl.getResult(i);
-    if (auto binOp = dyn_cast<AffineBinaryOpExpr>(result)) {
-      if (result.getKind() == AffineExprKind::FloorDiv) {
-        // Position of the dimension in dimToLvl.
-        auto pos = dyn_cast<AffineDimExpr>(binOp.getLHS()).getPosition();
-        assert(lvlExprComponents.find(pos) == lvlExprComponents.end() &&
-               "expected only one floordiv for each dimension");
-        SmallVector<AffineExpr, 3> components;
-        // Level variable for floordiv.
-        components.push_back(getAffineDimExpr(i, context));
-        // Multiplier.
-        components.push_back(binOp.getRHS());
-        // Map key is the position of the dimension.
-        lvlExprComponents[pos] = components;
-      } else if (result.getKind() == AffineExprKind::Mod) {
-        auto pos = dyn_cast<AffineDimExpr>(binOp.getLHS()).getPosition();
-        assert(lvlExprComponents.find(pos) != lvlExprComponents.end() &&
-               "expected floordiv before mod");
-        // Add level variable for mod to the same vector
-        // of the corresponding floordiv.
-        lvlExprComponents[pos].push_back(getAffineDimExpr(i, context));
-      } else {
-        assert(false && "expected floordiv or mod");
+  const Dimension dimRank = dimToLvl.getNumDims(); // Original dimensions
+  const Level lvlRank = dimToLvl.getNumResults();  // Encoded levels
+
+  // Maps each original dimension to its block decomposition components
+  std::map<unsigned, std::pair<AffineExpr, AffineExpr>> blockMap;
+
+  // First pass: collect block components (floordiv and mod)
+  for (Level l = 0; l < lvlRank; ++l) {
+    if (auto binOp = dyn_cast<AffineBinaryOpExpr>(dimToLvl.getResult(l))) {
+      if (binOp.getKind() == AffineExprKind::FloorDiv) {
+        // Extract dimension position and block size
+        auto dim = cast<AffineDimExpr>(binOp.getLHS()).getPosition();
+        auto blockSize = cast<AffineConstantExpr>(binOp.getRHS()).getValue();
+        blockMap[dim].first = getAffineDimExpr(l, context);
+        blockMap[dim].second = getAffineConstantExpr(blockSize, context);
+      } else if (binOp.getKind() == AffineExprKind::Mod) {
+        // Verify matching block size and record offset level
+        auto dim = cast<AffineDimExpr>(binOp.getLHS()).getPosition();
+        auto blockSize = cast<AffineConstantExpr>(binOp.getRHS()).getValue();
+        if (blockMap[dim].second != getAffineConstantExpr(blockSize, context))
+          return AffineMap(); // Block size mismatch
+        blockMap[dim].first = blockMap[dim].first * blockMap[dim].second +
+                              getAffineDimExpr(l, context);
       }
-    } else {
-      lvlExprs.push_back(getAffineDimExpr(i, context));
     }
   }
-  // Build lvlExprs from lvlExprComponents.
-  // For example, for il = i floordiv 2 and ii = i mod 2, the components
-  // would be [il, 2, ii]. It could be used to build the AffineExpr
-  // i = il * 2 + ii in lvlToDim.
-  for (auto &components : lvlExprComponents) {
-    assert(components.second.size() == 3 &&
-           "expected 3 components to build lvlExprs");
-    auto mulOp = getAffineBinaryOpExpr(
-        AffineExprKind::Mul, components.second[0], components.second[1]);
-    auto addOp =
-        getAffineBinaryOpExpr(AffineExprKind::Add, mulOp, components.second[2]);
-    lvlExprs.push_back(addOp);
+
+  // Second pass: build dimension expressions
+  for (Dimension d = 0; d < dimRank; ++d) {
+    if (blockMap.count(d)) {
+      // Blocked dimension: l_i * blockSize + l_j
+      lvlExprs.push_back(blockMap[d].first);
+    } else {
+      // Non-blocked dimension: direct level mapping
+      lvlExprs.push_back(getAffineDimExpr(d, context));
+    }
   }
-  return dimToLvl.get(dimToLvl.getNumResults(), 0, lvlExprs, context);
+
+  // AffineMap inputs correspond to levels (lvlRank), outputs to original dims
+  return AffineMap::get(
+      /*dimCount=*/lvlRank,
+      /*symbolCount=*/0, lvlExprs, context);
 }
 
 SmallVector<unsigned> mlir::sparse_tensor::getBlockSize(AffineMap dimToLvl) {
@@ -1229,7 +1341,8 @@ getNormalizedEncodingForSpecifier(SparseTensorEncodingAttr enc) {
       0, 0,
       Attribute(), // explicitVal (irrelevant to storage specifier)
       Attribute(), // implicitVal (irrelevant to storage specifier)
-      enc.getDimSlices(), enc.getELLBlockSize(), enc.getELLCols(), enc.getBellIdxType(), enc.getBellIdxBase());
+      enc.getDimSlices(), enc.getELLBlockSize(), enc.getELLCols(),
+      enc.getBellIdxType(), enc.getBellIdxBase());
 }
 
 StorageSpecifierType

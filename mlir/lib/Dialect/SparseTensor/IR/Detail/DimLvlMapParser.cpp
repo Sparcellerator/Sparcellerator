@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "DimLvlMapParser.h"
+#include "mlir/Dialect/SparseTensor/IR/Enums.h"
 
 using namespace mlir;
 using namespace mlir::sparse_tensor;
@@ -281,24 +282,46 @@ DimLvlMapParser::parseLvlVarBinding(bool requireLvlVarBinding) {
   FAILURE_IF_FAILED(parser.parseEqual())
   return var;
 }
+static std::pair<unsigned, unsigned> getBELLParameters(LevelType lt) {
+  if (!lt.isa<LevelFormat::BELLPACK>())
+    return {0, 0};
+
+  const uint64_t bits = static_cast<uint64_t>(lt);
+  return {
+      static_cast<unsigned>((bits >> 32) & 0xFFFF), // blockSize
+      static_cast<unsigned>((bits >> 48) & 0xFFFF)  // ellCols
+  };
+}
 
 ParseResult DimLvlMapParser::parseLvlSpec(bool requireLvlVarBinding) {
-  // Parse the optional lvl-var binding. `requireLvlVarBinding`
-  // specifies whether that "optional" is actually Must or MustNot.
+  // Parse the optional lvl-var binding.
   const auto varRes = parseLvlVarBinding(requireLvlVarBinding);
   FAILURE_IF_FAILED(varRes)
   const LvlVar var = *varRes;
 
-  // Parse the lvl affine expr, with only the dim-vars in scope.
+  // Parse the level affine expression.
   AffineExpr affine;
   FAILURE_IF_FAILED(parser.parseAffineExpr(dimsAndSymbols, affine))
   LvlExpr expr{affine};
 
   FAILURE_IF_FAILED(parser.parseColon())
-  const auto type = lvlTypeParser.parseLvlType(parser);
-  FAILURE_IF_FAILED(type)
+  
+  // Parse the level type - this handles the entire level format including "blocked_ell" and parameters.
+  const auto typeResult = lvlTypeParser.parseLvlType(parser);
+  FAILURE_IF_FAILED(typeResult)
+  LevelType levelType = static_cast<LevelType>(*typeResult);
+  
+  // Extract BELL parameters if applicable
+  unsigned ellBlockSize = 0;
+  unsigned ellCols = 0;
+  
+  // Check if the level type is for BELL format
+  if (isEllpackLT(levelType)) {
+    // Extract parameters from the level type
+    std::tie(ellBlockSize, ellCols) = getBELLParameters(levelType);
+  }
 
-  lvlSpecs.emplace_back(var, expr, static_cast<LevelType>(*type));
+  lvlSpecs.emplace_back(var, expr, levelType, ellBlockSize, ellCols);
   return success();
 }
 
